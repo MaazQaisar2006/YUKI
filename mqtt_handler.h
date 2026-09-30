@@ -27,6 +27,7 @@ extern bool pendingCloudSync;
 extern bool pendingSysSave;
 extern bool mqttForceReconnect;
 extern bool cloudRestored;
+extern bool localMemoryLoaded;
 extern unsigned long mqttBootedAt;
 extern char aiMsg[256];
 extern char workspace[3200];
@@ -41,6 +42,45 @@ extern Adafruit_SSD1306 display;
 extern IPAddress phoneIP;
 extern unsigned long lastPresencePulse;
 
+static const char* memoryV2TopicPrefix = "scout-net/memory_v2/";
+extern PubSubClient mqttClient;
+
+inline bool syncStructuredMemoryToCloud() {
+  if (!mqttClient.connected()) return false;
+  char topic[128];
+  char payload[320];
+  uint8_t count = 0;
+  uint8_t expected = 0;
+  bool allPublished = true;
+  for (uint8_t slot = 0; slot < memoryV2GetFactCount(); slot++) {
+    if (!memoryV2BuildCloudFact(slot, payload, sizeof(payload))) continue;
+    expected++;
+    snprintf(topic, sizeof(topic), "%s%s/fact/%u", memoryV2TopicPrefix, DEVICE_ID, slot);
+    if (mqttClient.publish(topic, payload, true)) count++;
+    else allPublished = false;
+
+    uint32_t archiveKey = 0;
+    int archiveCategory = -1;
+    if (memoryV2BuildArchiveFact(slot, payload, sizeof(payload), &archiveKey, &archiveCategory)) {
+      snprintf(topic, sizeof(topic), "%s%s/archive/%08lx", memoryV2TopicPrefix, DEVICE_ID,
+               (unsigned long)archiveKey);
+      if (!mqttClient.publish(topic, payload, true)) allPublished = false;
+      if (archiveCategory >= 0) {
+        snprintf(topic, sizeof(topic), "%s%s/archive/latest/%d", memoryV2TopicPrefix, DEVICE_ID, archiveCategory);
+        if (!mqttClient.publish(topic, payload, true)) allPublished = false;
+      }
+    } else {
+      allPublished = false;
+    }
+    yield();
+  }
+  snprintf(topic, sizeof(topic), "%s%s/commit", memoryV2TopicPrefix, DEVICE_ID);
+  snprintf(payload, sizeof(payload), "%lu,%u", (unsigned long)memoryV2GetRevision(), expected);
+  if (!mqttClient.publish(topic, payload, true)) allPublished = false;
+  LOGI("CLOUD", "Structured memory sync revision=%lu facts=%u", (unsigned long)memoryV2GetRevision(), count);
+  return allPublished && mqttClient.connected();
+}
+
 inline void clearCloudKey(const char* k); // Forward declaration
 
 // --- MQTT CLIENT ---
@@ -49,7 +89,7 @@ WiFiClient espClient;
 PubSubClient mqttClient(espClient);
 
 // Renamed to syncMemoryToCloud to avoid conflict with saveCoreMemory() in the main .ino
-inline void syncMemoryToCloud() {
+inline bool syncMemoryToCloud() {
   // Local save (LittleFS) — serialize into workspace then write atomically
   if (canAllocJson(3072)) {
     DynamicJsonDocument doc(3072);
@@ -66,12 +106,17 @@ inline void syncMemoryToCloud() {
   }
   // Cloud Sync (MQTT Retained) - Full personality backup
   if (mqttClient.connected()) {
+    bool cloudOk = true;
     auto pub = [&](const char* k, const char* v) {
       if (!v || strlen(v) == 0) return; // Skip empty
-      if (strlen(v) > 2000) { LOGW("CLOUD","Payload too large for %s, skipping", k); return; }
+      if (strlen(v) > 2000) { LOGW("CLOUD","Payload too large for %s, skipping", k); cloudOk = false; return; }
       snprintf(workspace, 128, "scout-net/memory/%s/%s", DEVICE_ID, k);
-      mqttClient.publish(workspace, v, true);
-      LOGD("CLOUD","Published %s (%u bytes)", k, (unsigned int)strlen(v));
+      if (!mqttClient.publish(workspace, v, true)) {
+        cloudOk = false;
+        LOGW("CLOUD", "Publish failed for %s (%u bytes)", k, (unsigned int)strlen(v));
+      } else {
+        LOGD("CLOUD", "Published %s (%u bytes)", k, (unsigned int)strlen(v));
+      }
     };
     // Core personality
     pub("summary", core_chatSummary);
@@ -120,7 +165,10 @@ inline void syncMemoryToCloud() {
       }
     }
     LOGI("CLOUD","Full personality sync complete (%u topics)", 25);
+    cloudOk = syncStructuredMemoryToCloud() && cloudOk;
+    return cloudOk && mqttClient.connected();
   }
+  return false;
 }
 
 void saveSys();
@@ -132,12 +180,6 @@ const char* allStatusTopic = "scout-net/devices/+/status"; // Wildcard to discov
 
 // This function is the heart of MQTT. It runs every time a message arrives.
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  // --- BOOT GRACE PERIOD: Ignore retained messages for 5s after connect ---
-  if (mqttBootedAt > 0 && millis() - mqttBootedAt < 5000) {
-    LOGD("MQTT","Ignoring message during boot grace period");
-    return;
-  }
-
   // Reduced from 800 to 512 to avoid stack overflow on WiFi task (shared 4KB stack)
   char message[512];
   unsigned int msg_len = min((unsigned int)sizeof(message) - 1, length);
@@ -145,20 +187,38 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   message[msg_len] = '\0';
 
   // --- DEDUPLICATION: Ignore duplicate messages from broker queue ---
-  // Circular buffer of last 50 message hashes (~1.6KB RAM)
-  static char msgHashes[50][33];
+  // Deduplicate complete topic+payload pairs without storing whole messages.
+  static char msgHashes[50][17];
   static int msgHashHead = 0;
   static int msgHashCount = 0;
 
-  char msgHash[33];
-  snprintf(msgHash, sizeof(msgHash), "%lu-%s", (unsigned long)length, message);
+  uint32_t hashA = 2166136261UL;
+  uint32_t hashB = 0x9e3779b9UL;
+  for (const char* p = topic; *p; p++) {
+    uint8_t value = (uint8_t)*p;
+    hashA = (hashA ^ value) * 16777619UL;
+    hashB ^= value + 0x9e3779b9UL + (hashB << 6) + (hashB >> 2);
+  }
+  for (unsigned int i = 0; i < length; i++) {
+    uint8_t value = payload[i];
+    hashA = (hashA ^ value) * 16777619UL;
+    hashB ^= value + 0x9e3779b9UL + (hashB << 6) + (hashB >> 2);
+  }
+  char msgHash[17];
+  snprintf(msgHash, sizeof(msgHash), "%08lx%08lx", (unsigned long)hashA, (unsigned long)hashB);
+
+  bool isMemoryTopic = strncmp(topic, "scout-net/memory/", 17) == 0 ||
+                       strncmp(topic, "scout-net/memory_v2/", 20) == 0;
+  bool isStructuredMemoryTopic = strncmp(topic, "scout-net/memory_v2/", 20) == 0;
 
   // Check circular buffer for duplicate
   bool isDuplicate = false;
-  for (int i = 0; i < msgHashCount; i++) {
-    if (strcmp(msgHashes[i], msgHash) == 0) { 
-      isDuplicate = true; 
-      break; 
+  if (!isStructuredMemoryTopic) {
+    for (int i = 0; i < msgHashCount; i++) {
+      if (strcmp(msgHashes[i], msgHash) == 0) {
+        isDuplicate = true;
+        break;
+      }
     }
   }
   if (isDuplicate) { 
@@ -166,45 +226,58 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     return; 
   }
 
-  // Add to circular buffer (use strncpy to prevent overflow)
-  strncpy(msgHashes[msgHashHead], msgHash, 32);
-  msgHashes[msgHashHead][32] = '\0';
-  msgHashHead = (msgHashHead + 1) % 50;
-  if (msgHashCount < 50) msgHashCount++;
+  // Structured memory must be processed on every retained replay and search.
+  if (!isStructuredMemoryTopic) {
+    strncpy(msgHashes[msgHashHead], msgHash, sizeof(msgHashes[0]) - 1);
+    msgHashes[msgHashHead][sizeof(msgHashes[0]) - 1] = '\0';
+    msgHashHead = (msgHashHead + 1) % 50;
+    if (msgHashCount < 50) msgHashCount++;
+  }
 
-  LOGD("MQTT","Recv Topic: %s | Msg: %s", topic, message);
+  if (!isMemoryTopic) LOGD("MQTT", "Recv Topic: %s | Msg: %s", topic, message);
 
   // --- CLOUD MEMORY SYNC ---
+  // Layer 3: Only overwrite local fields if they're empty (local data takes priority)
   static char memPrefixMatch[64]; 
   snprintf(memPrefixMatch, sizeof(memPrefixMatch), "scout-net/memory/%s/", DEVICE_ID);
   if (strncmp(topic, memPrefixMatch, strlen(memPrefixMatch)) == 0) {
     const char* key = topic + strlen(memPrefixMatch);
+    // Numeric fields: always safe to update from cloud
     if (strcmp(key, "rpgHP") == 0) rpgHP = atoi(message);
     else if (strcmp(key, "rpgGold") == 0) rpgGold = atoi(message);
-    else if (strcmp(key, "rpgStory") == 0) { strncpy(rpgStory, message, 255); rpgStory[255] = '\0'; }
-    else if (strcmp(key, "summary") == 0) { strncpy(core_chatSummary, message, 1023); core_chatSummary[1023] = '\0'; }
     else if (strcmp(key, "aff") == 0) sys.affinity = atoi(message);
     else if (strcmp(key, "xp") == 0)    { sys.xp    = atoi(message); pendingSysSave = true; }
     else if (strcmp(key, "level") == 0) { sys.level  = atoi(message); pendingSysSave = true; }
     else if (strcmp(key, "tz") == 0)    { sys.timeZoneOffset = atol(message); pendingSysSave = true; }
-    // NEW: Personality / memory restore
-    else if (strcmp(key, "obsession") == 0) { strncpy(core_currentObsession, message, 31); core_currentObsession[31] = '\0'; }
-    else if (strcmp(key, "kdays") == 0) core_knownDays = atoi(message);
-    else if (strcmp(key, "obsessionTime") == 0) obsessionSetTime = atol(message);
-    else if (strcmp(key, "lastExchangeTone") == 0) { strncpy(core_lastExchangeTone, message, 15); core_lastExchangeTone[15] = '\0'; }
-    else if (strcmp(key, "lastConcern") == 0) { strncpy(core_lastConcern, message, 63); core_lastConcern[63] = '\0'; }
+    else if (strcmp(key, "rpgSel") == 0) rpgChoiceIdx = atoi(message);
+    else if (strcmp(key, "kdays") == 0) { if (core_knownDays == 0) core_knownDays = atoi(message); }
+    else if (strcmp(key, "obsessionTime") == 0) { if (obsessionSetTime == 0) obsessionSetTime = atol(message); }
     else if (strcmp(key, "badDayFlag") == 0) core_badDayFlag = (message[0] == '1');
     else if (strcmp(key, "missedMorning") == 0) missedMorning = (message[0] == '1');
     else if (strcmp(key, "missedMorningMentioned") == 0) missedMorningMentioned = (message[0] == '1');
-    else if (strcmp(key, "selfReflection") == 0) { strncpy(core_selfReflection, message, 255); core_selfReflection[255] = '\0'; }
-    else if (strcmp(key, "personalityContext") == 0) { strncpy(personalityContext, message, 1151); personalityContext[1151] = '\0'; }
-    else if (strcmp(key, "personalityContext_1") == 0) { strncpy(personalityContext, message, 1024); personalityContext[1024] = '\0'; }
+    // Text fields: overwrite if local is empty OR if this was a crash reboot (cloud is fresher)
+    else if (strcmp(key, "summary") == 0) {
+      bool shouldRestore = (strlen(core_chatSummary) == 0) || (esp_reset_reason() == ESP_RST_PANIC);
+      if (shouldRestore && strlen(message) > strlen(core_chatSummary)) {
+        strncpy(core_chatSummary, message, 1023);
+        core_chatSummary[1023] = '\0';
+        pendingMemorySave = true;
+        LOGI("CLOUD","Restored summary from cloud (reason: %s)", strlen(core_chatSummary) == 0 ? "empty" : "crash recovery");
+      }
+    }
+    else if (strcmp(key, "rpgStory") == 0) { if (strlen(rpgStory) <= 16) { strncpy(rpgStory, message, 255); rpgStory[255] = '\0'; } }
+    else if (strcmp(key, "obsession") == 0) { if (strlen(core_currentObsession) == 0) { strncpy(core_currentObsession, message, 31); core_currentObsession[31] = '\0'; } }
+    else if (strcmp(key, "lastExchangeTone") == 0) { if (strlen(core_lastExchangeTone) == 0) { strncpy(core_lastExchangeTone, message, 15); core_lastExchangeTone[15] = '\0'; } }
+    else if (strcmp(key, "lastConcern") == 0) { if (strlen(core_lastConcern) == 0) { strncpy(core_lastConcern, message, 63); core_lastConcern[63] = '\0'; } }
+    else if (strcmp(key, "selfReflection") == 0) { if (strlen(core_selfReflection) == 0) { strncpy(core_selfReflection, message, 255); core_selfReflection[255] = '\0'; } }
+    else if (strcmp(key, "personalityContext") == 0) { if (strlen(personalityContext) == 0) { strncpy(personalityContext, message, 1151); personalityContext[1151] = '\0'; } }
+    else if (strcmp(key, "personalityContext_1") == 0) { if (strlen(personalityContext) == 0) { strncpy(personalityContext, message, 1024); personalityContext[1024] = '\0'; } }
     else if (strcmp(key, "personalityContext_2") == 0) { 
       size_t curLen = strlen(personalityContext);
       if (curLen < 1150) strncat(personalityContext, message, 1150 - curLen); 
     }
-    else if (strcmp(key, "systemPrompt") == 0) { strncpy(systemPrompt, message, 2047); systemPrompt[2047] = '\0'; }
-    else if (strcmp(key, "systemPrompt_1") == 0) { strncpy(systemPrompt, message, 1024); systemPrompt[1024] = '\0'; }
+    else if (strcmp(key, "systemPrompt") == 0) { if (strlen(systemPrompt) == 0) { strncpy(systemPrompt, message, 2047); systemPrompt[2047] = '\0'; } }
+    else if (strcmp(key, "systemPrompt_1") == 0) { if (strlen(systemPrompt) == 0) { strncpy(systemPrompt, message, 1024); systemPrompt[1024] = '\0'; } }
     else if (strcmp(key, "systemPrompt_2") == 0) { 
       size_t curLen = strlen(systemPrompt);
       if (curLen < 2046) strncat(systemPrompt, message, 2046 - curLen); 
@@ -212,9 +285,33 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     else if (strcmp(key, "rpgC1") == 0) { strncpy(rpgChoices[0], message, 39); rpgChoices[0][39] = '\0'; }
     else if (strcmp(key, "rpgC2") == 0) { strncpy(rpgChoices[1], message, 39); rpgChoices[1][39] = '\0'; }
     else if (strcmp(key, "rpgC3") == 0) { strncpy(rpgChoices[2], message, 39); rpgChoices[2][39] = '\0'; }
-    else if (strcmp(key, "rpgSel") == 0) rpgChoiceIdx = atoi(message);
     LOGD("CLOUD","Restored key: %s", key);
     return; // Don't process memory sync as a DM
+  }
+
+  char v2Prefix[96];
+  snprintf(v2Prefix, sizeof(v2Prefix), "%s%s/", memoryV2TopicPrefix, DEVICE_ID);
+  if (strncmp(topic, v2Prefix, strlen(v2Prefix)) == 0) {
+    const char* key = topic + strlen(v2Prefix);
+    if (strncmp(key, "fact/", 5) == 0) {
+      memoryV2AcceptCloudFact(message);
+    } else if (strncmp(key, "archive/", 8) == 0) {
+      memoryV2AcceptCloudArchiveFact(message);
+    } else if (strcmp(key, "commit") == 0) {
+      unsigned long revision = 0;
+      unsigned int expected = 0;
+      if (sscanf(message, "%lu,%u", &revision, &expected) == 2) {
+        memoryV2NoteCloudCommit((uint32_t)revision, (uint8_t)expected);
+      }
+    }
+    return;
+  }
+
+  // Keep early boot chatter out of the UI, but allow retained memory restore
+  // and an explicit archive lookup to complete during the boot grace window.
+  if (mqttBootedAt > 0 && millis() - mqttBootedAt < 5000) {
+    LOGD("MQTT", "Ignoring non-memory message during boot grace period");
+    return;
   }
 
   // Simplified DM handling: ignore everything except from the phone
@@ -276,12 +373,13 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       else if (strcmp(cmd, "ls") == 0) {
         File root = LittleFS.open("/");
         strcpy(termOutputBuffer, "Files:\n");
+        int termUsed = strlen(termOutputBuffer);
         File file = root.openNextFile();
         while (file) {
-          if (strlen(termOutputBuffer) > 400) { strcat(termOutputBuffer, "..."); break; }
+          if (termUsed > 400) { safeAppend(termOutputBuffer, sizeof(termOutputBuffer), &termUsed, "..."); break; }
           char line[64];
           snprintf(line, sizeof(line), "%-16s %u B\n", file.name(), (unsigned int)file.size());
-          strcat(termOutputBuffer, line);
+          safeAppend(termOutputBuffer, sizeof(termOutputBuffer), &termUsed, "%s", line);
           file = root.openNextFile();
           yield();
         }
@@ -290,10 +388,15 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       else if (strcmp(cmd, "calc") == 0) {
         int a, b; char op;
         if (sscanf(arg, "%d %c %d", &a, &op, &b) == 3) {
-          if (op == '+') snprintf(termOutputBuffer, 512, "%d", a + b);
-          else if (op == '-') snprintf(termOutputBuffer, 512, "%d", a - b);
-          else if (op == '*') snprintf(termOutputBuffer, 512, "%d", a * b);
-          else if (op == '/') snprintf(termOutputBuffer, 512, "%d", (b!=0)? a/b : 0);
+          long long result = 0;
+          bool validOp = true;
+          if (op == '+') result = (long long)a + b;
+          else if (op == '-') result = (long long)a - b;
+          else if (op == '*') result = (long long)a * b;
+          else if (op == '/') result = (b != 0) ? (long long)a / b : 0;
+          else validOp = false;
+          if (validOp) snprintf(termOutputBuffer, sizeof(termOutputBuffer), "%lld", result);
+          else strcpy(termOutputBuffer, "Usage: >calc 5 * 5");
         } else {
           strcpy(termOutputBuffer, "Usage: >calc 5 * 5");
         }
@@ -375,8 +478,44 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       else if (strcmp(cmd, "phoneip") == 0) {
         snprintf(termOutputBuffer, 512, "Phone IP: %s", phoneIP.toString().c_str());
       }
+      else if (strcmp(cmd, "scan") == 0) {
+        // Check if the configured phone IP is reachable on multiple ports
+        snprintf(termOutputBuffer, 512, "Probing %s...", phoneIP.toString().c_str());
+        sendMessage(lastSenderID, termOutputBuffer);
+        termOutputBuffer[0] = '\0';
+        int termUsed = 0;
+        int ports[] = {80, 443, 8080, 8443, 53};
+        const char* portNames[] = {"HTTP", "HTTPS", "8080", "8443", "DNS"};
+        int openPort = -1;
+        for (int p = 0; p < 5; p++) {
+          WiFiClient probe;
+          probe.setTimeout(1500);
+          unsigned long start = millis();
+          if (probe.connect(phoneIP, ports[p])) {
+            char line[64];
+            snprintf(line, sizeof(line), "%s(%d): OK %lums\n", portNames[p], ports[p], millis() - start);
+            safeAppend(termOutputBuffer, sizeof(termOutputBuffer), &termUsed, "%s", line);
+            if (openPort < 0) openPort = ports[p];
+            probe.stop();
+          } else {
+            char line[64];
+            snprintf(line, sizeof(line), "%s(%d): closed\n", portNames[p], ports[p]);
+            safeAppend(termOutputBuffer, sizeof(termOutputBuffer), &termUsed, "%s", line);
+          }
+          yield();
+        }
+        if (openPort >= 0) {
+          char ok[64];
+          snprintf(ok, sizeof(ok), "Phone ONLINE (port %d open)", openPort);
+          safeAppend(termOutputBuffer, sizeof(termOutputBuffer), &termUsed, "%s", ok);
+          userIsHome = true;
+          lastPresencePulse = millis();
+        } else {
+          safeAppend(termOutputBuffer, sizeof(termOutputBuffer), &termUsed, "Phone UNREACHABLE");
+        }
+      }
       else if (strcmp(cmd, "hlp") == 0 || strcmp(cmd, "help") == 0) {
-        strcpy(termOutputBuffer, "CMDS: calc, write, ping, ls, cat, rm, free, reboot, oledon/off, soundon/off, viewmem, resetmem, setphoneip, phoneip");
+        strcpy(termOutputBuffer, "CMDS: calc, write, ping, scan, ls, cat, rm, free, reboot, oledon/off, soundon/off, viewmem, resetmem, setphoneip, phoneip");
       }
       else {
         snprintf(termOutputBuffer, 512, "Unknown: %s", cmd);
@@ -446,6 +585,11 @@ bool mqttReconnect() {
     
     snprintf(memTopic, sizeof(memTopic), "scout-net/memory/%s/+", DEVICE_ID);
     mqttClient.subscribe(memTopic);
+    char v2Topic[128];
+    snprintf(v2Topic, sizeof(v2Topic), "%s%s/fact/+", memoryV2TopicPrefix, DEVICE_ID);
+    mqttClient.subscribe(v2Topic);
+    snprintf(v2Topic, sizeof(v2Topic), "%s%s/commit", memoryV2TopicPrefix, DEVICE_ID);
+    mqttClient.subscribe(v2Topic);
 
     char allDmTopic2[128];
     snprintf(allDmTopic2, sizeof(allDmTopic2), "scout-net/dm/%s/from/+", DEVICE_ID);
@@ -475,7 +619,70 @@ void setupMqtt() {
   snprintf(statusTopic, sizeof(statusTopic), "scout-net/devices/%s/status", DEVICE_ID);
 
   updateMqttServer();
+  // Retained personality chunks can exceed PubSubClient's 512-byte default.
+  // Leave room for the MQTT topic/header plus the 1 KB context chunks.
+  if (!mqttClient.setBufferSize(2304)) {
+    LOGW("MQTT", "Could not grow packet buffer; large retained syncs may fail");
+  }
   mqttClient.setCallback(mqttCallback);
+}
+
+bool memoryV2SearchCloud(const char* query, char* target, size_t targetSize) {
+  if (!target || targetSize == 0) return false;
+  target[0] = '\0';
+  if (!query || !mqttClient.connected()) return false;
+
+  memoryV2CloudSearchBegin(query);
+  char topic[128];
+  int category = memoryV2QueryCategory(query);
+  if (category >= 0) {
+    snprintf(topic, sizeof(topic), "%s%s/archive/latest/%d", memoryV2TopicPrefix, DEVICE_ID, category);
+  } else {
+    snprintf(topic, sizeof(topic), "%s%s/archive/#", memoryV2TopicPrefix, DEVICE_ID);
+  }
+  if (!mqttClient.subscribe(topic)) {
+    memoryV2CloudSearchEnd(target, targetSize);
+    LOGW("CLOUD", "Memory search subscribe failed");
+    return false;
+  }
+
+  const unsigned long started = millis();
+  const unsigned long maxWait = category >= 0 ? 800 : 1800;
+  const unsigned long minWait = 250;
+  const unsigned long quietWait = 220;
+  while (mqttClient.connected() && millis() - started < maxWait) {
+    mqttClient.loop();
+    yield();
+    if (millis() - started >= minWait && millis() - memoryV2CloudSearchLastRx >= quietWait) break;
+    delay(3);
+  }
+  mqttClient.unsubscribe(topic);
+  memoryV2CloudSearchEnd(target, targetSize);
+  // A retained latest pointer can be missing or contain a rejected malformed
+  // value while an older valid fact remains in the append-only archive.
+  if (category >= 0 && target[0] == '\0' && mqttClient.connected()) {
+    memoryV2CloudSearchBegin(query);
+    snprintf(topic, sizeof(topic), "%s%s/archive/#", memoryV2TopicPrefix, DEVICE_ID);
+    if (mqttClient.subscribe(topic)) {
+      const unsigned long fallbackStarted = millis();
+      while (mqttClient.connected() && millis() - fallbackStarted < 1800) {
+        mqttClient.loop();
+        yield();
+        if (millis() - fallbackStarted >= 300 && millis() - memoryV2CloudSearchLastRx >= 220) break;
+        delay(3);
+      }
+      mqttClient.unsubscribe(topic);
+      memoryV2CloudSearchEnd(target, targetSize);
+      LOGI("CLOUD", "Memory archive fallback category=%d hits=%u result=%u bytes",
+           category, memoryV2CloudHitCount, (unsigned)strlen(target));
+    } else {
+      memoryV2CloudSearchEnd(target, targetSize);
+      LOGW("CLOUD", "Memory archive fallback subscribe failed");
+    }
+  }
+  LOGI("CLOUD", "Memory search category=%d hits=%u result=%u bytes",
+       category, memoryV2CloudHitCount, (unsigned)strlen(target));
+  return target[0] != '\0';
 }
 
 void sendMessage(const char* recipientID, const char* message) {
@@ -526,11 +733,17 @@ void restoreFromCloud() {
   
   // Wait for retained messages to arrive (max 3 seconds)
   unsigned long startWait = millis();
-  int topicsReceived = 0;
   while (millis() - startWait < 3000) {
     mqttClient.loop();
     yield();
     delay(10);
+  }
+  
+  // If local memory was empty and cloud filled gaps, save to disk
+  if (!localMemoryLoaded && strlen(core_chatSummary) > 0) {
+    LOGI("CLOUD","Cloud restored empty local memory — saving to disk");
+    saveCoreMemory();
+    localMemoryLoaded = true; // Mark as loaded so we don't overwrite again
   }
   
   unsigned long elapsed = millis() - startMs;

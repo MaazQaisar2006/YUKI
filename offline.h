@@ -150,7 +150,7 @@ static OfflineIntent classifyIntent(const char* prompt) {
   if (strstr(prompt, "advice") || strstr(prompt, "help me") || strstr(prompt, "what should")) return INTENT_ADVICE;
 
   // System
-  if (strstr(prompt, "random thought") || strstr(prompt, "independent_thought")) return INTENT_RANDOM;
+  if (strstr(prompt, "random thought")) return INTENT_RANDOM;
   if (strstr(prompt, "leveled up") || strstr(prompt, "level up")) return INTENT_LEVEL_UP;
   if (strstr(prompt, "conversation") || strstr(prompt, "tell me about") || strstr(prompt, "chat")) return INTENT_CHAT;
 
@@ -191,9 +191,9 @@ static void offlinePulseAction() {
     Emotion pool[] = {LOVE, SHY, CONFUSED, WINK};
     Emotion e = pool[random(0, 4)];
     currentEmotion = e; emotionSetTime = millis();
-    { uint8_t vc = 1; switch(e) { case LOVE: vc=6; break; case SHY: vc=2; break; case CONFUSED: vc=2; break; case WINK: vc=3; break; default: vc=1; } emotionVariantIndex[(int)e] = random(0, vc); }
+    { uint8_t vc = 1; switch(e) { case LOVE: vc=6; break; case SHY: vc=2; break; case CONFUSED: vc=2; break; case WINK: vc=3; break; default: vc=1; } emotionVariantIndex[(int)e] = (emotionVariantIndex[(int)e] + 1) % vc; }
   } else if (r < 80) {
-    if (sys.soundOn && sys.level >= 3) sound_hum();
+    if (sys.soundOn) sound_hum();
   } else if (r < 90) {
     strncpy(aiMsg, "*sigh*", sizeof(aiMsg) - 1);
     aiMsg[sizeof(aiMsg) - 1] = '\0';
@@ -201,10 +201,10 @@ static void offlinePulseAction() {
     if (sys.soundOn) sound_sleepy();
   } else if (r < 95) {
     currentEmotion = SHY; emotionSetTime = millis();
-    emotionVariantIndex[(int)SHY] = random(0, 2);
+    emotionVariantIndex[(int)SHY] = (emotionVariantIndex[(int)SHY] + 1) % 2;
   } else {
     currentEmotion = THINKING_FACE; emotionSetTime = millis();
-    emotionVariantIndex[(int)THINKING_FACE] = random(0, 2);
+    emotionVariantIndex[(int)THINKING_FACE] = (emotionVariantIndex[(int)THINKING_FACE] + 1) % 2;
     silentThoughtUntil = millis() + 4000;
   }
 }

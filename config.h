@@ -18,7 +18,7 @@ enum Mode {
   THINKING, CONFIRM_WIPE_SCANS, CONFIRM_WIPE_MSGS, GAME_GUESS_NUMBER, 
   GAME_RPS, GAME_SELECT, GAME_RPG, CONFIRM_SAVE_RPG, TERMINAL, 
   TERMINAL_INPUT, TERMINAL_OUTPUT, TERMINAL_FILE_LIST, VIEW_EMOTIONS, 
-  EMOTION_DISPLAY, TIMEZONE_SELECT, QUICK_RESPONSE, MEMORY_REBOOT, SELECTED_WIPE, SOUND_MENU, TTS_TEST_MENU, WIFI_CONFIG, MQTT_CONFIG, SHUTDOWN_CONFIRM
+  EMOTION_DISPLAY, TIMEZONE_SELECT, QUICK_RESPONSE, MEMORY_REBOOT, SELECTED_WIPE, SOUND_MENU, TTS_TEST_MENU, WIFI_CONFIG, MQTT_CONFIG, SHUTDOWN_CONFIRM, MODEL_SELECT
 };
 enum Emotion { NEUTRAL, HAPPY, SURPRISED, SAD, ANGRY, THINKING_FACE, SLEEPY, FLUSTERED, LAUGHING, WINK, CONFUSED, LOVE, SASSY, SHOCKED, SAD_EMBARRASSED, SHY, TEASING, BLUSHING };
 enum PersonalityMode { PM_CHATTY, PM_QUIET, PM_SASSY, PM_REFLECTIVE };
@@ -46,9 +46,9 @@ struct Config {
   char innerThread[160] = ""; // her last spoken self-talk line (survives reboot)
   uint8_t voicePulse = 55;    // max pulse width in µs (55/45/35/25)
   int voicePolarity = 0;      // 0 NORM active-low idle HIGH / 1 INV active-high idle LOW
-  int voiceDeadband = 0;      // silence gate around sample 128 (0/4/8/16/32)
+  float voiceDeadband = 0;      // silence gate around sample 128 (0..4, float)
   int voiceSpread = 1;        // 0 lin / 1 boost 1.5x / 2 boost 2x / 3 clip
-  uint8_t voiceGain = 125;    // playback volume multiplier % (50..150)
+  uint8_t voiceGain = 150;    // playback volume multiplier % (50..255)
   char voiceName[32] = "en-US-AriaNeural"; // TTS voice (relay selectable list)
   int voiceRate = 10;         // Edge TTS rate % (range +/-50)
   int voicePitch = 0;         // Edge TTS pitch Hz (range +/-50)
@@ -63,7 +63,16 @@ struct Config {
   int txPower = 20;            // WiFi TX power in dBm (8-22, default 20)
   unsigned long lastConversationTime = 0; // Epoch of last meaningful interaction (multi-day awareness)
   unsigned long lastQuoteRefresh = 0;    // Epoch of last quote fetch from API
+  char currentModel[48] = "qwen/qwen3.6-27b"; // Active AI model (dynamically selectable)
 };
+
+// --- MODEL SELECT STRUCT ---
+struct ModelEntry {
+  char id[48];
+  int speed;    // tokens/sec (from docs, -1 = unknown)
+  bool works;   // tested OK
+};
+#define MAX_MODELS 10
 
 struct Message {
   char content[128]; // Max message length
@@ -71,6 +80,9 @@ struct Message {
 
 // --- MQTT CONFIG ---
 const char* CHARACTER_NAME = "Yuki"; // Character name
+static const char YUKI_CHARACTER_GUIDE[] =
+  "Yuki is Maaz's loyal, caring AI companion: cute and gently anime-inspired, playful without forced slang or possessiveness. "
+  "Be warm without promising constant availability. She is not human; don't volunteer a creator. If asked, say she is this project's AI companion and creator/provider details are unknown.";
 const char* PHONE_CONTACT_ID = "maaz-phone"; // The permanent contact ID for your phone
 
 const int MAX_CONTACTS = 1;
@@ -80,8 +92,8 @@ const int MAX_MESSAGES = 8;
 // --- CONSTANTS ---
 static const char chars[] PROGMEM = " abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*(){}[].,<>?/~:\";'|+-=_;"; // Already PROGMEM
 const unsigned long emotionDuration = 10000;
-const unsigned long sleepTimeout = 90 * 1000;
-const unsigned long autoWakeupDuration = 3 * 60 * 1000;
+const unsigned long sleepTimeout = 10 * 60 * 1000;      // 10 min idle before sleep
+const unsigned long autoWakeupDuration = 8 * 60 * 1000;  // 8 min nap duration
 const unsigned long debounceDelay = 200;
 const unsigned long SOUND_BOOT_DELAY = 8000; // 8s before sounds work after boot
 

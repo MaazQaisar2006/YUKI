@@ -130,7 +130,7 @@ void drawAesthetica() {
 
     currentEmotion = nextMood;
     emotionSetTime = millis(); // Reset timer for the next step in the staircase
-    { uint8_t vc = 1; switch(nextMood) { case NEUTRAL: vc=6; break; case HAPPY: vc=3; break; case SURPRISED: vc=2; break; case SAD: vc=2; break; case ANGRY: vc=4; break; case THINKING_FACE: vc=2; break; case SLEEPY: vc=2; break; case FLUSTERED: vc=3; break; case LAUGHING: vc=3; break; case WINK: vc=3; break; case CONFUSED: vc=2; break; case LOVE: vc=6; break; case SASSY: vc=2; break; case SHOCKED: vc=4; break; case SHY: vc=2; break; case TEASING: vc=5; break; case BLUSHING: vc=5; break; default: vc=1; } emotionVariantIndex[(int)currentEmotion] = random(0, vc); }
+    { uint8_t vc = 1; switch(nextMood) { case NEUTRAL: vc=6; break; case HAPPY: vc=3; break; case SURPRISED: vc=2; break; case SAD: vc=2; break; case ANGRY: vc=4; break; case THINKING_FACE: vc=2; break; case SLEEPY: vc=2; break; case FLUSTERED: vc=3; break; case LAUGHING: vc=3; break; case WINK: vc=3; break; case CONFUSED: vc=2; break; case LOVE: vc=6; break; case SASSY: vc=2; break; case SHOCKED: vc=4; break; case SHY: vc=2; break; case TEASING: vc=5; break; case BLUSHING: vc=5; break; default: vc=1; } emotionVariantIndex[(int)currentEmotion] = (emotionVariantIndex[(int)currentEmotion] + 1) % vc; }
   }
 
   // 1. Status Bar — rotates through info pages while visible

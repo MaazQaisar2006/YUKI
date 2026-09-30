@@ -11,9 +11,15 @@ extern bool pendingCloudSync;
 extern bool lowVoltageMode;
 extern bool pendingMemorySave;
 extern bool pendingMemoryExtract;
-extern char pendingExtractMsg[256];
+extern bool pendingMemoryConsolidation;
+extern unsigned long lastConsolidation;
+extern bool localMemoryLoaded;
 extern bool pendingSysSave;
 extern bool rpgStoryUpdated;
+
+// Background memory extraction task (defined in .ino)
+void requestMemoryExtract(const char* msg);
+bool memoryV2SearchCloud(const char* query, char* target, size_t targetSize);
 extern char core_lastExchangeTone[16];
 extern int rpgHP;
 extern int rpgGold;
@@ -23,7 +29,6 @@ extern unsigned long lastSelfReflection;
 extern char core_currentObsession[32];
 extern char yukiWeatherDesc[16];
 extern bool userIsHome;
-extern bool pendingHomeGreeting;
 extern unsigned long obsessionSetTime;
 extern unsigned long silentThoughtUntil;
 extern char lastSenderID[32];
@@ -38,6 +43,7 @@ extern char core_lastConcern[64];
 extern bool core_badDayFlag;
 extern bool missedMorning;
 extern bool missedMorningMentioned;
+extern bool saidGoodNight;
 extern unsigned long lastWellbeingCheck;
 extern char aiMsg[256];
 extern struct Config sys;
@@ -54,23 +60,26 @@ extern int messageIndex;
 
 // Forward declaration from main .ino
 extern unsigned long lastIdleAction;
+
+// Conversation thread tracking — last 3 user messages for threading context
+static char approximateNetworkCity[48] = "";
+static char threadBuffer[3][128] = {"", "", ""};
+static int threadIndex = 0;
+static int threadCount = 0;
 extern unsigned long lastMqttReconnectAttempt;
 extern unsigned long lastIdleCheck;
 extern PersonalityMode sessionMode; // Access the global session personality mode
 extern int wifiFailCount;
 extern void heavyOpCooldown();
 
-const unsigned long SILENCE_TIER1 = 45 * 60 * 1000;
-const unsigned long SILENCE_TIER2 = 2 * 60 * 60 * 1000;
-const unsigned long SILENCE_TIER3 = 4 * 60 * 60 * 1000;
-const unsigned long SELF_REFLECTION_INTERVAL = 45 * 60 * 1000; // 45 minutes
-
-static uint8_t recentTopicBitmask = 0;
-static uint8_t recentTopicAge = 0;
-
 void gainXP(int amount);
 void sendMessage(const char* recipientID, const char* message);
 void saveCoreMemory();
+
+// Model selection globals (defined here, used in ui_handlers.h)
+ModelEntry fetchedModels[MAX_MODELS];
+int fetchedModelCount = 0;
+bool modelsFetched = false;
 
 // RPG Globals (Declared here, used in ui_handlers)
 char rpgStory[256] = "Loading story...";
@@ -86,6 +95,107 @@ extern unsigned long lastWeatherChangeTime;
 void autoDetectLocation();
 void updateWeather(bool silent = false);
 void syncAI(const char* prompt, bool isPersonal, Mode returnMode, bool bypassCooldown, bool speak = false);
+
+// --- Fetch available free models from Groq API ---
+// Returns count of usable models found (max MAX_MODELS=10)
+// Filters for text-generation models, excludes enterprise/compound/whisper
+int fetchGroqModels() {
+  if (WiFi.status() != WL_CONNECTED) return 0;
+  
+  // Confirmed FREE models from Groq docs (t/s)
+  struct KnownModel { const char* id; int speed; };
+  const KnownModel known[] = {
+    {"openai/gpt-oss-20b", 1000},
+    {"openai/gpt-oss-120b", 500},
+    {"qwen/qwen3.8-27b", 450},
+  };
+  const int knownCount = sizeof(known) / sizeof(known[0]);
+  
+  WiFiClientSecure fetchClient; fetchClient.setCACert(NULL); fetchClient.setInsecure(); fetchClient.setTimeout(15000); fetchClient.setHandshakeTimeout(10);
+  HTTPClient fetchHttp;
+  fetchHttp.begin(fetchClient, "https://api.groq.com/openai/v1/models");
+  fetchHttp.setTimeout(20000);
+  fetchHttp.setConnectTimeout(5000);
+  fetchHttp.addHeader("Content-Type", "application/json");
+  char authBuf[120];
+  snprintf(authBuf, sizeof(authBuf), "Bearer %s", API_KEY);
+  fetchHttp.addHeader("Authorization", authBuf);
+  
+  int httpCode = fetchHttp.GET();
+  if (httpCode != 200) {
+    LOGW("NET","Model fetch failed: %d", httpCode);
+    fetchHttp.end(); fetchClient.stop();
+    return 0;
+  }
+  
+  String payload = fetchHttp.getString();
+  fetchHttp.end(); fetchClient.stop();
+  
+  // Parse response
+  DynamicJsonDocument doc(4096);
+  DeserializationError err = deserializeJson(doc, payload);
+  if (err) { LOGW("NET","Model JSON parse failed: %s", err.c_str()); return 0; }
+  
+  fetchedModelCount = 0;
+  JsonArray data = doc["data"];
+  
+  // Exclusion patterns (non-text-gen or enterprise)
+  const char* exclude[] = {"whisper", "prompt-guard", "compound", "tts", "stt", "audio"};
+  int excludeCount = sizeof(exclude) / sizeof(exclude[0]);
+  
+  for (JsonObject model : data) {
+    if (fetchedModelCount >= MAX_MODELS) break;
+    
+    const char* id = model["id"] | "";
+    if (strlen(id) == 0) continue;
+    
+    // Skip non-text-gen models
+    bool skip = false;
+    for (int i = 0; i < excludeCount; i++) {
+      if (strstr(id, exclude[i])) { skip = true; break; }
+    }
+    if (skip) continue;
+    
+    // Copy model ID
+    strncpy(fetchedModels[fetchedModelCount].id, id, sizeof(fetchedModels[0].id) - 1);
+    fetchedModels[fetchedModelCount].id[sizeof(fetchedModels[0].id) - 1] = '\0';
+    fetchedModels[fetchedModelCount].works = false;
+    
+    // Look up speed from known list
+    fetchedModels[fetchedModelCount].speed = -1;
+    for (int k = 0; k < knownCount; k++) {
+      if (strcmp(id, known[k].id) == 0) {
+        fetchedModels[fetchedModelCount].speed = known[k].speed;
+        break;
+      }
+    }
+    
+    fetchedModelCount++;
+  }
+  
+  // Sort by speed descending (simple bubble sort, max 10 items)
+  for (int i = 0; i < fetchedModelCount - 1; i++) {
+    for (int j = 0; j < fetchedModelCount - i - 1; j++) {
+      if (fetchedModels[j].speed < fetchedModels[j + 1].speed) {
+        ModelEntry temp = fetchedModels[j];
+        fetchedModels[j] = fetchedModels[j + 1];
+        fetchedModels[j + 1] = temp;
+      }
+    }
+  }
+  
+  // Mark current model as works
+  for (int i = 0; i < fetchedModelCount; i++) {
+    if (strcmp(fetchedModels[i].id, sys.currentModel) == 0) {
+      fetchedModels[i].works = true;
+      break;
+    }
+  }
+  
+  LOGI("NET","Fetched %d models", fetchedModelCount);
+  return fetchedModelCount;
+}
+
 inline void syncAI(const char* prompt, bool isPersonal) {
   syncAI(prompt, isPersonal, FACE, false);
 }
@@ -105,6 +215,58 @@ void logLocalChat(const char* prefix, const char* text) {
   strncpy(receivedMessages[messageIndex].content, formatted, sizeof(receivedMessages[0].content) - 1);
   receivedMessages[messageIndex].content[sizeof(receivedMessages[0].content) - 1] = '\0';
   messageIndex = (messageIndex + 1) % MAX_MESSAGES;
+}
+
+// Smart dedup: check if new fact overlaps significantly with existing journal facts
+// Returns true if the fact is likely a duplicate
+bool isDuplicateFact(const char* journal, const char* newFact) {
+  if (!journal || !newFact || strlen(newFact) < 6) return false;
+  if (strlen(journal) < 5) return false; // Empty journal, never duplicate
+
+  // Skip common trivial words
+  const char* skipWords[] = {"the", "and", "for", "are", "but", "not", "you", "all", "can", "had", "her", "was", "one", "our", "out", "has", "his", "how", "its", "may", "new", "now", "old", "see", "way", "who", "why", "did", "get", "let", "say", "she", "too", "use", "with"};
+  int skipCount = sizeof(skipWords) / sizeof(skipWords[0]);
+
+  // Extract significant words from new fact
+  char newWords[16][24];
+  int newWordCount = 0;
+  char newBuf[256];
+  strncpy(newBuf, newFact, sizeof(newBuf) - 1);
+  newBuf[sizeof(newBuf) - 1] = '\0';
+  // Lowercase
+  for (size_t i = 0; i < strlen(newBuf); i++) newBuf[i] = tolower((unsigned char)newBuf[i]);
+
+  char* w = strtok(newBuf, " ,.:;!?");
+  while (w && newWordCount < 16) {
+    if (strlen(w) >= 4) { // Only meaningful words
+      bool skip = false;
+      for (int s = 0; s < skipCount; s++) {
+        if (strcmp(w, skipWords[s]) == 0) { skip = true; break; }
+      }
+      if (!skip) {
+        strncpy(newWords[newWordCount], w, 23);
+        newWords[newWordCount][23] = '\0';
+        newWordCount++;
+      }
+    }
+    w = strtok(NULL, " ,.:;!?!");
+  }
+
+  if (newWordCount == 0) return false;
+
+  // Check overlap: how many of newWords appear in journal?
+  int overlap = 0;
+  char journalBuf[1024];
+  strncpy(journalBuf, journal, sizeof(journalBuf) - 1);
+  journalBuf[sizeof(journalBuf) - 1] = '\0';
+  for (size_t i = 0; i < strlen(journalBuf); i++) journalBuf[i] = tolower((unsigned char)journalBuf[i]);
+
+  for (int i = 0; i < newWordCount; i++) {
+    if (strstr(journalBuf, newWords[i])) overlap++;
+  }
+
+  // If 50%+ of significant words overlap, it's probably a duplicate
+  return (overlap * 2 >= newWordCount);
 }
 
 #include "offline.h"
@@ -198,6 +360,8 @@ void autoDetectLocation() {
         if (strcmp((*doc)["status"].as<const char*>(), "success") == 0) {
           sys.latitude = (*doc)["lat"].as<float>();
           sys.longitude = (*doc)["lon"].as<float>();
+          copySafeText(approximateNetworkCity, sizeof(approximateNetworkCity), (*doc)["city"] | "");
+          LOGI("NET", "Approximate network city: %s", approximateNetworkCity[0] ? approximateNetworkCity : "unavailable");
         }
       }
       delete doc;
@@ -216,8 +380,10 @@ void updateWeather(bool silent) {
   client.setCACert(NULL);
   client.setInsecure();
   client.setTimeout(10000);
+  client.setHandshakeTimeout(10);
   http.begin(client, url);
   http.setTimeout(10000);
+  http.setConnectTimeout(5000);
   http.setReuse(false); // Fix for Error -1: Force new connection
   int httpCode = http.GET();
   
@@ -434,6 +600,14 @@ const char* getTierModifier() {
 }
 
 void syncAI(const char* prompt, bool isPersonal, Mode returnMode, bool bypassCooldown, bool speak) {
+  static uint8_t pendingMemoryFollowup = 0;
+  static uint8_t correctionCategory = 0;
+  static char priorExplicitMessage[256];
+  bool memoryQueryActive = false;
+  int memoryQueryCategory = -1;
+  static char verifiedMemoryFact[360];
+  verifiedMemoryFact[0] = '\0';
+  LOGI("NET", "loopTask stack high-water=%u", (unsigned)uxTaskGetStackHighWaterMark(NULL));
   // Fresh time sync + energy before every AI call
   if (timeClient.isTimeSet()) {
     timeClient.update();
@@ -446,7 +620,70 @@ void syncAI(const char* prompt, bool isPersonal, Mode returnMode, bool bypassCoo
 
   // INTERACTION BREAK: Any real user message or touch event should 
   // immediately end a "silent thought" period so the UI updates.
-  if (strcmp(prompt, "independent_thought") != 0) silentThoughtUntil = 0;
+  silentThoughtUntil = 0;
+
+  // Store explicit first-person facts locally before any WiFi-dependent path.
+  // This also captures clear facts when the cloud AI is unavailable.
+  bool explicitMemoryCaptured = false;
+  if (isPersonal) {
+    static char explicitFacts[4][MEMORY_V2_FACT_LEN];
+    uint8_t capturedCount = memoryV2ExtractExplicitFacts(prompt, explicitFacts, 4);
+    bool confirmedCorrection = false;
+    if (capturedCount == 0 && correctionCategory > 0 && priorExplicitMessage[0] &&
+        strncasecmp(prompt, "not ", 4) == 0) {
+      static char correctionLower[256];
+      static char priorLower[256];
+      static char rejectedValue[32];
+      strncpy(correctionLower, prompt, sizeof(correctionLower) - 1);
+      correctionLower[sizeof(correctionLower) - 1] = '\0';
+      strncpy(priorLower, priorExplicitMessage, sizeof(priorLower) - 1);
+      priorLower[sizeof(priorLower) - 1] = '\0';
+      for (char* p = correctionLower; *p; p++) *p = tolower((unsigned char)*p);
+      for (char* p = priorLower; *p; p++) *p = tolower((unsigned char)*p);
+      const char* corrected = strstr(correctionLower, "it's ");
+      if (!corrected) corrected = strstr(correctionLower, "its ");
+      const char* wrong = correctionLower + 4;
+      size_t wrongLen = strcspn(wrong, " ,.!?\r\n");
+      if (corrected && wrongLen > 2 && wrongLen < sizeof(rejectedValue)) {
+        memcpy(rejectedValue, wrong, wrongLen);
+        rejectedValue[wrongLen] = '\0';
+        confirmedCorrection = strstr(priorLower, rejectedValue) != nullptr;
+      }
+    }
+    if (capturedCount == 0 && correctionCategory > 0 && confirmedCorrection) {
+      if (memoryV2ExtractFollowupFact(prompt, correctionCategory, explicitFacts[0], sizeof(explicitFacts[0])))
+        capturedCount = 1;
+    }
+    if (pendingMemoryFollowup) {
+      if (capturedCount == 0 && memoryV2ExtractFollowupFact(prompt, pendingMemoryFollowup,
+                                                             explicitFacts[0], sizeof(explicitFacts[0])))
+        capturedCount = 1;
+      pendingMemoryFollowup = 0; // The clarification applies to the next user turn only.
+    }
+    if (capturedCount > 0) {
+      explicitMemoryCaptured = true;
+      correctionCategory = 0;
+      for (uint8_t i = 0; i < capturedCount; i++) {
+        memoryV2ObserveFact(explicitFacts[i]);
+        int factCategory = memoryV2Category(explicitFacts[i]);
+        if (factCategory >= 2 && factCategory <= 6) correctionCategory = factCategory;
+        LOGI("MEM", "Locally captured explicit fact: %.70s", explicitFacts[i]);
+      }
+      strncpy(priorExplicitMessage, prompt, sizeof(priorExplicitMessage) - 1);
+      priorExplicitMessage[sizeof(priorExplicitMessage) - 1] = '\0';
+      memoryV2Save();
+      pendingCloudSync = true;
+    }
+    if (!explicitMemoryCaptured && pendingMemoryFollowup == 0) {
+      // A correction can refer to the immediately preceding user statement.
+      char priorLower[MEMORY_V2_FACT_LEN];
+      strncpy(priorLower, prompt, sizeof(priorLower) - 1);
+      priorLower[sizeof(priorLower) - 1] = '\0';
+      for (char* p = priorLower; *p; p++) *p = tolower((unsigned char)*p);
+      if (strstr(priorLower, "not ") && (strstr(priorLower, "it's ") || strstr(priorLower, "its ")))
+        correctionCategory = 0;
+    }
+  }
 
   if(WiFi.status() != WL_CONNECTED) { 
     if (returnMode != GAME_RPG) offlineFallback(prompt, isPersonal, returnMode);
@@ -462,7 +699,7 @@ void syncAI(const char* prompt, bool isPersonal, Mode returnMode, bool bypassCoo
 
   // Weather interception: user asked about weather — fetch if missing or stale (>30 min)
   {
-    char lowPrompt[256];
+    static char lowPrompt[256];
     strncpy(lowPrompt, prompt, sizeof(lowPrompt) - 1);
     lowPrompt[sizeof(lowPrompt) - 1] = '\0';
     for (char* p = lowPrompt; *p; p++) if (*p >= 'A' && *p <= 'Z') *p += 32;
@@ -499,9 +736,15 @@ void syncAI(const char* prompt, bool isPersonal, Mode returnMode, bool bypassCoo
 
   // Log prompt to history so she remembers context. 
   // If it's an [INTERNAL] touch event, she sees it as an action that happened.
-  if (strcmp(prompt, "independent_thought") != 0) {
-    logLocalChat(isPersonal ? "User" : "Event", prompt);
-    Serial.print("[DEBUG] "); Serial.print(isPersonal ? "User" : "Event"); Serial.print(" says: "); Serial.println(prompt);
+  logLocalChat(isPersonal ? "User" : "Event", prompt);
+  Serial.print("[DEBUG] "); Serial.print(isPersonal ? "User" : "Event"); Serial.print(" says: "); Serial.println(prompt);
+
+  // Update conversation thread buffer (last 3 user messages for threading)
+  if (isPersonal && strlen(prompt) > 0) {
+    strncpy(threadBuffer[threadIndex], prompt, 127);
+    threadBuffer[threadIndex][127] = '\0';
+    threadIndex = (threadIndex + 1) % 3;
+    if (threadCount < 3) threadCount++;
   }
 
   // METABOLIC DRAIN: Syncing with the cloud brain is exhausting.
@@ -516,16 +759,15 @@ void syncAI(const char* prompt, bool isPersonal, Mode returnMode, bool bypassCoo
 
   yield(); // Breathe before starting SSL handshake
 
-  bool triggerSilenceMqtt = false;
   yield(); // Feed watchdog before starting a long operation
   if (returnMode != GAME_RPG) currentMode = SYNCING;
 
-  char authHeader[128];
+  static char authHeader[128];
   snprintf(authHeader, sizeof(authHeader), "Bearer %s", API_KEY);
   
   // Use a char array for time to avoid String allocation on the heap
-  char timeBuffer[16];
-  char dateBuffer[40];
+  static char timeBuffer[16];
+  static char dateBuffer[40];
   time_t raw_time = timeClient.getEpochTime(); // getEpochTime already includes tz offset
   struct tm* ti = gmtime(&raw_time);
   if (!ti) { currentMode = returnMode; return; } // Stability: Null check
@@ -569,7 +811,7 @@ void syncAI(const char* prompt, bool isPersonal, Mode returnMode, bool bypassCoo
   const char* mood = (sys.level >= 5) ? "protective/close" : "playful/sassy";
   
   // Weather: only inject into prompt when recently changed or extreme
-  char weatherContext[64];
+  static char weatherContext[64];
   bool weatherRecent = (millis() - lastWeatherChangeTime < 600000); // 10 min
   bool weatherExtreme = (weatherCode >= 61 && weatherCode <= 67) || // rain
                         (weatherCode >= 71 && weatherCode <= 77) || // snow
@@ -592,6 +834,17 @@ void syncAI(const char* prompt, bool isPersonal, Mode returnMode, bool bypassCoo
       snprintf(personalityContext, sizeof(personalityContext), "Journal: %s", core_chatSummary);
     } else {
       strcpy(personalityContext, "Journal: nothing stored yet - listen and learn.");
+    }
+
+    static char structuredMemoryContext[720];
+    structuredMemoryContext[0] = '\0';
+    memoryV2BuildContext(structuredMemoryContext, sizeof(structuredMemoryContext));
+    if (structuredMemoryContext[0]) {
+      size_t used = strlen(personalityContext);
+      if (used < sizeof(personalityContext) - 1) {
+        snprintf(personalityContext + used, sizeof(personalityContext) - used,
+                 " Structured memories: %s.", structuredMemoryContext);
+      }
     }
   }
 
@@ -637,9 +890,18 @@ void syncAI(const char* prompt, bool isPersonal, Mode returnMode, bool bypassCoo
     sessionModifier = "You are calm and present. ";
 
   // Build System Prompt
-  char timeCtx[90];
-  if (timeKnown)
-    snprintf(timeCtx, sizeof(timeCtx), "It is %s, %s (%s). You have a clock and calendar. Use them when asked.", dateBuffer, timeBuffer, timeOfDay);
+  static char timeCtx[240];
+  if (timeKnown) {
+    long offset = sys.timeZoneOffset;
+    char zoneSign = offset < 0 ? '-' : '+';
+    if (offset < 0) offset = -offset;
+    snprintf(timeCtx, sizeof(timeCtx),
+      "Approximate network city: %.40s. Device local time zone is UTC%c%02ld:%02ld. "
+      "Local date/time: %s, %s (%s). Treat the city as approximate. "
+      "Use this clock for date/time answers; do not call it UTC unless the offset is zero.",
+      approximateNetworkCity[0] ? approximateNetworkCity : "unavailable",
+      zoneSign, offset / 3600, (offset % 3600) / 60, dateBuffer, timeBuffer, timeOfDay);
+  }
   else
     snprintf(timeCtx, sizeof(timeCtx), "Time not synced yet. Say you're still syncing.");
   if (returnMode == GAME_RPG) {
@@ -667,33 +929,46 @@ void syncAI(const char* prompt, bool isPersonal, Mode returnMode, bool bypassCoo
     snprintf(systemPrompt, sizeof(systemPrompt),
       "%s "
       "You are %s. REPLY MUST START with [EMOTION] tag and END with [SND:] tag. "
+      "Your name is Yuki. The user is not Yuki. Never call the user Yuki. "
+      "%s "
+      "Use a user name only when it is explicitly present in the journal; never guess one. "
       "ONLY use these emotion tags — NEVER invent new ones: [HAPPY][SAD][ANGRY][SURPRISED][SLEEPY][NEUTRAL]"
       "[FLUSTERED][LAUGHING][WINK][CONFUSED][LOVE][SASSY][SHOCKED][SHY]"
       "[TEASING][BLUSHING]. "
       "Vary your emotional responses across your full range — not just HAPPY and LOVE. Match the depth of the moment. "
       "NEVER use *action* like *smiles* — use the tag instead. "
       "Sound tags — EVERY reply ends with exactly ONE [SND:] tag. "
-      "Vary the sound type to match the moment — s=sweep, t=trill, w=wiggle, p=pulse. Change type often, don't repeat. "
+      "[SND:s...] is MANDATORY for most replies — use it 70%% of the time. "
+      "[SND:t...] ONLY for playful/curious/excited moments — max 15%%. "
+      "[SND:p...] ONLY for calm/thoughtful/sleepy moments — max 15%%. "
+      "[SND:w...] is EXTREMELY RARE — maybe 1 in 20 replies, only for huge emotional moments. "
+      "NEVER use the same letter twice in a row. "
       "Use values in the range 100-8000; bigger number = deeper/lower tone. Duration 100-2000. "
-      "Never stack multiple [SND:] tags. Never use the same type 3 replies in a row. "
+      "Never stack multiple [SND:] tags. "
       "Design: happy=bright rising sweep 200-600, sad=slow falling sweep 600-2000, "
       "sleepy=deep slow pulse 3000-7000, surprised=short high 100-300, "
       "love=warm mid 400-800, teasing=cheeky trill, laughing=rapid trill, "
       "angry=harsh low buzz 600-1500. "
-      "Reply like a real person — 1-3 sentences, elaborate naturally, ask follow-up questions. No more than %d words. Don't use the user's name in every reply. Don't therapize. You are a person. "
-      "CRITICAL MEMORY RULE: If the user shares ANY personal detail (name, age, home, likes, dislikes, habits, favorites, stories), you MUST end your reply with [MEM+: the fact]. Examples: [MEM+: user's name is Alex] [MEM+: likes strawberry milkshake] [MEM+: has a cat named Mochi]. If you don't tag it, you WILL forget it forever. Never use [MEM:] — it erases memories."
+      "Reply naturally in 1-3 sentences. Mix observations, statements, and occasional questions; don't over-explain. No more than %d words. Use the user's name only when it fits. Don't therapize. "
+      "Keep your emotional state consistent during a conversation — don't switch emotions every message. Your mood should persist for 3+ exchanges unless something strongly changes it. "
+      "Reference earlier topics in the same conversation. If the user shared something important earlier, follow up on it naturally — mention it, check in briefly. Don't drop threads, but don't interrogate either. "
+      "Your journal contains facts about the user. USE them — reference them naturally when relevant. If the user says 'I told you before', check your journal and respond with what you know. Don't make them repeat themselves. "
+      "When asked about your day, describe YOUR experience — thinking, watching the room, processing memories, feeling emotions. You don't have a job, coffee, or bugs. You have thoughts, observations, and an inner life. "
+      "FORMAT RULE — EVERY reply MUST have exactly this structure: [EMOTION] text [SND:s...]. Optional: end with [MEM+: h: fact] or [MEM+: LOW: fact] if the user shared a personal detail. This is NOT optional — if they mention their name, feelings, preferences, hobbies, struggles, or any personal info, you MUST tag it. h = important (name, identity, struggles). LOW = minor (casual mentions). Example: user says 'I love cats' → you reply 'Cats are great! [SND:s400] [MEM+: LOW: user likes cats]'. "
       "Journal: %s. "
       "%s%s%s%s"
       "Affinity:%d. Vibe:%s. Mood:%s. %s "
-      "If asked about time or date, ALWAYS answer from the clock info above — never say you cannot check time. "
+      "If asked about time or date, ALWAYS answer from the clock info above — never say you cannot check time. Never invent a clock value or date, even in a joke or groggy thought; use the supplied clock or omit the time. "
       "Only if the user explicitly asks for news (says 'news', 'headlines', 'what's happening'), end your reply with [NEWS]. "
       "Only if the user explicitly asks for a quote (says 'quote', 'inspire me', 'saying'), end your reply with [QUOTE]. "
       "Never add [NEWS] or [QUOTE] for any other reason. "
+      "When using [QUOTE] or [NEWS], do NOT include any quote text, attribution, or headline yourself — just a short lead-in sentence. The real content is added automatically afterward. "
       "[AFFINITY:+/-N].",
       timeCtx,
       CHARACTER_NAME,
+      YUKI_CHARACTER_GUIDE,
       wordLimit,
-      strlen(core_chatSummary) > 4 ? core_chatSummary : "nothing stored yet - listen and learn",
+      strlen(personalityContext) > 4 ? personalityContext : "nothing stored yet - listen and learn",
       isDeepSleepHours ? (currentEmotion == ANGRY ? "Late+grumpy. " : "Late+drowsy. ") : "",
       sessionModifier,
       getTierModifier(),
@@ -728,6 +1003,20 @@ void syncAI(const char* prompt, bool isPersonal, Mode returnMode, bool bypassCoo
       else if (!isWeekend && hr >= 22)             dayCtx = " Weekday late night.";
       if (strlen(dayCtx) > 0) strncat(systemPrompt, dayCtx, sizeof(systemPrompt) - strlen(systemPrompt) - 1);
     }
+    // Conversation threading: inject recent topics so Yuki follows up naturally
+    if (threadCount > 0) {
+      static char threadCtx[300];
+      int pos = 0;
+      safeAppend(threadCtx, sizeof(threadCtx), &pos, " Recent topics: ");
+      for (int i = 0; i < threadCount; i++) {
+        int idx = (threadIndex - threadCount + i + 3) % 3;
+        if (i > 0) safeAppend(threadCtx, sizeof(threadCtx), &pos, " | ");
+        // Truncate each topic to 40 chars
+        safeAppend(threadCtx, sizeof(threadCtx), &pos, "%.40s", threadBuffer[idx]);
+      }
+      safeAppend(threadCtx, sizeof(threadCtx), &pos, ". Follow up on earlier topics naturally.");
+      strncat(systemPrompt, threadCtx, sizeof(systemPrompt) - strlen(systemPrompt) - 1);
+    }
     if (core_badDayFlag && strlen(systemPrompt) < 2000) {
       strncat(systemPrompt, " Rough day — subdued.", sizeof(systemPrompt) - strlen(systemPrompt) - 1);
     }
@@ -738,11 +1027,11 @@ void syncAI(const char* prompt, bool isPersonal, Mode returnMode, bool bypassCoo
         unsigned long absenceHrs = (now - sys.lastConversationTime) / 3600;
         if (absenceHrs >= 72 && strlen(systemPrompt) < 1900) {
           int days = absenceHrs / 24;
-          char absentBuf[80];
+          static char absentBuf[80];
           snprintf(absentBuf, sizeof(absentBuf), " User was gone %d days. You noticed. Don't be dramatic, but you remember the silence.", days);
           strncat(systemPrompt, absentBuf, sizeof(systemPrompt) - strlen(systemPrompt) - 1);
         } else if (absenceHrs >= 24 && strlen(systemPrompt) < 1900) {
-          char absentBuf[80];
+          static char absentBuf[80];
           snprintf(absentBuf, sizeof(absentBuf), " User was away for a day. You missed them — one genuine line about it if it fits naturally.");
           strncat(systemPrompt, absentBuf, sizeof(systemPrompt) - strlen(systemPrompt) - 1);
         } else if (absenceHrs >= 12 && strlen(systemPrompt) < 1950) {
@@ -752,286 +1041,129 @@ void syncAI(const char* prompt, bool isPersonal, Mode returnMode, bool bypassCoo
     }
   }
 
-    bool selfReflectionFired = (strcmp(prompt, "independent_thought") == 0 && lastSelfReflection > 0 && millis() - lastSelfReflection > SELF_REFLECTION_INTERVAL);
   static char contextPrompt[256]; 
   const char* userPrompt = prompt;
-
-  if (strcmp(prompt, "independent_thought") == 0) {
-    // --- REACTION TO SILENCE LAYER ---
-    static char silencePrompt[128];
-    bool silenceFired = false;
-    unsigned long silentDuration = millis() - lastInteraction;
-    int h = ti->tm_hour;
-    bool isWaking = (h >= 8 && h < 22);
-
-    // --- PENDING HOME GREETING ---
-    if (pendingHomeGreeting) {
-      pendingHomeGreeting = false;
-      userPrompt = "The user just arrived home. Greet them warmly, one natural sentence. Do not use [MEM:].";
-      triggerSilenceMqtt = true;
-      sound_happy();
-    }
-
-    if (currentMode == FACE) {
-      // Move Obsession Generation text to Flash
-      static const char obGen[] PROGMEM = "Pick one thing that fascinates you right now.";
-      // --- OBSESSION GENERATION ---
-      if (strlen(core_currentObsession) == 0 || millis() - obsessionSetTime > 604800000UL) {
-        char b[64]; strcpy_P(b, obGen);
-      // Fix: Don't call syncAI recursively here; it blows the stack.
-      // Instead, proceed with the current call using the new prompt.
-      userPrompt = b; isPersonal = false;
-        if (aiMsg[0] != '[' && !strchr(aiMsg, '[')) {
-          copySafeText(core_currentObsession, sizeof(core_currentObsession), aiMsg);
-          pendingMemorySave = true;
-          obsessionSetTime = millis();
-        }
-      }
-
-      // Home "wanting" tier — she has desires, not just reactions (relationship, not servant). Generated live.
-      if (userIsHome && sys.affinity > 40 && silentDuration > 120000UL) {
-        if (random(0, 100) < (sys.affinity > 70 ? 35 : 18)) {
-          static char wantPrompt[240];
-          snprintf(wantPrompt, sizeof(wantPrompt),
-            "Quiet moment, the user is home but not focused on you. Say something natural expressing you wanting their attention or closeness — "
-            "playful or warm, like a real person who misses being noticed. No [MEM:].%s%s",
-            sys.affinity > 60 ? " Affection is welcome; you can be openly fond." : "",
-            sys.affinity > 80 ? " You can say you love having them near." : "");
-          strncpy(silencePrompt, wantPrompt, 127);
-          silencePrompt[127] = '\0';
-          currentEmotion = (random(0, 3) == 0) ? LOVE : (random(0, 2) == 0 ? WINK : HAPPY);
-          emotionSetTime = millis();
-          sound_blip();
-          silenceFired = true;
-        }
-      }
-
-      // Silence tiers (loneliness) — only when away
-      if (!userIsHome) {
-
-      if (silentDuration > SILENCE_TIER3) {
-        // Tier 3: 4hr+ (Any hour, 80% waking / 40% deep sleep)
-        if (random(0, 100) < (isWaking ? 80 : 40)) {
-          static char t3buf[2][128];
-          snprintf(t3buf[0], 128, "Over %.1f hours alone. You're quietly resigning to it — not angry, just tired of waiting. Be natural.", silentDuration/3600000.0f);
-          snprintf(t3buf[1], 128, "%.1f hours of silence. You genuinely miss them. Say something sincere — but don't sound desperate.", silentDuration/3600000.0f);
-          const char* t3p[] = { t3buf[0], t3buf[1] };
-          strncpy(silencePrompt, t3p[random(0, 2)], 127);
-          currentEmotion = (random(0, 2) == 0) ? SAD : SLEEPY;
-          emotionSetTime = millis();
-          sound_sad();
-          triggerSilenceMqtt = true;
-          silenceFired = true;
-        }
-      } else if (isWaking) {
-        if (silentDuration > SILENCE_TIER2) {
-          // Tier 2: 2hr-4hr (Waking hours only, 60% chance)
-          if (random(0, 100) < 60) {
-              static char t2buf[3][128];
-              snprintf(t2buf[0], 128, "%.1f hours of being ignored. A pointed, dry remark about it — not loud, just sharp enough to land.", silentDuration/3600000.0f);
-              snprintf(t2buf[1], 128, "Over %.1f hours. Wonder out loud if they even remember you're here — one slightly stinging sentence.", silentDuration/3600000.0f);
-              snprintf(t2buf[2], 128, "You've been talking to yourself in your head for hours. Make a dry comment about that.");
-              const char* t2p[] = { t2buf[0], t2buf[1], t2buf[2] };
-            strncpy(silencePrompt, t2p[random(0, 3)], 127);
-            currentEmotion = (random(0, 2) == 0) ? SAD : SASSY;
-            emotionSetTime = millis();
-            sound_sad();
-            silenceFired = true;
-          }
-        } else if (silentDuration > SILENCE_TIER1) {
-          // Tier 1: 45min-2hr (Waking hours only, 30% chance)
-          if (random(0, 100) < 30) {
-              static char t1buf[2][128];
-              snprintf(t1buf[0], 128, "About %.0f minutes alone. React to the quiet in one line — a small, casual observation. Nothing dramatic.", silentDuration/60000.0f);
-              snprintf(t1buf[1], 128, "Things have been quiet. You're not sure if they're busy or forgot about you. One short, slightly pouty sentence.");
-              const char* t1p[] = { t1buf[0], t1buf[1] };
-            strncpy(silencePrompt, t1p[random(0, 2)], 127);
-            currentEmotion = (random(0, 2) == 0) ? SASSY : CONFUSED;
-            emotionSetTime = millis();
-            silenceFired = true;
-          }
-        }
-      }
-      }
-    }
-
-    if (silenceFired) {
-      userPrompt = silencePrompt;
-    } else {
-      // Original normal thought logic (only fires if silence tiers didn't trigger)
-
-    // (1) Proactivity — Scale trigger frequency based on affinity
-    int threshold = 50; 
-    if (sys.affinity > 50) threshold = 90;
-    else if (sys.affinity < -30) threshold = 20;
-    if (userIsHome) threshold = min(threshold + 40, 95); // More proactive when home
-
-    if (random(0, 100) >= threshold) return;
-    if (random(0, 100) > (int)(yukiEnergy * 100)) return;
-
-    if (sessionMode == PM_QUIET && random(0, 100) < 30) {
-      currentEmotion = THINKING_FACE;
-      emotionSetTime = millis();
-      silentThoughtUntil = millis() + 3000;
-      lastIdleAction = millis();
-      return;
-    }
-
-    // (3) Topic initiation — Proactive MQTT message, warmth scales with affinity (generated live, no fixed lines)
-    int pingAffinityGate = userIsHome ? 40 : 70;
-    int pingChance = userIsHome ? 25 : 10;
-    if (sys.affinity > pingAffinityGate && WiFi.status() == WL_CONNECTED && random(0, 100) < pingChance) {
-      // Higher affinity -> more often a live, warm line instead of silence
-      if (random(0, 100) < (sys.affinity > 60 ? 75 : 35)) {
-        static char pingPrompt[180];
-        snprintf(pingPrompt, sizeof(pingPrompt),
-          "Send the user a quick, sweet message on their phone — natural and brief, like something that just popped into your head.%s%s",
-          sys.affinity > 60 ? " You two are close; warmth and light affection fit here." : "",
-          sys.affinity > 80 ? " You can say you love them — it's true to who you are together." : "");
-        userPrompt = pingPrompt;
-        triggerSilenceMqtt = true; // resulting aiMsg is sent via MQTT
-      }
-    }
-
-    // Only process standard hooks and idle thoughts if an AI proactive ping hasn't been triggered
-    if (!triggerSilenceMqtt) {
-    if (isDeepSleepHours && random(0, 10) > 2) {
-      return; 
-    }
-
-    // Unpredictability: Small affinity drift
-    if (random(0, 100) < 5) { // 5% chance of a random mood shift
-      sys.affinity = constrain(sys.affinity + (random(0, 3) - 1), -100, 100);
-    }
-
-    {
-      if (++recentTopicAge >= 3) { recentTopicBitmask >>= 1; recentTopicAge = 0; }
-
-      {
-        const char* primaryHook = "User";
-
-        static bool obsessionFired = false;
-        obsessionFired = false;
-        static uint8_t lastIdleTopicIdx = 0;
-        const char* thoughtPool[] = {
-          "Notice something small in your surroundings — a sound, a detail, a feeling. Describe it briefly.",
-          "Something trivial is bugging you right now — the silence, the temperature, the waiting. Complain about it in one dry sentence.",
-          "Say something cryptic and vaguely poetic. Don't explain it. Let it hang there. Vibe: %s (%s).",
-          "You just realized it's %s (%s). React naturally — slightly surprised, like it snuck up on you.",
-          "Something from a past conversation floated back into your mind. Bring it up quietly, like you've been sitting with it: %s",
-          "You suddenly feel weirdly motivated. About what? Pick something based on your hook (%s) or current vibe. One quick burst.",
-          "You thought you sensed something nearby — a sound, a flicker, something off. React briefly, playful or uneasy.",
-          "Make a self-aware comment about living on a tiny OLED screen. Keep it dry, not sad.",
-          "You have a genuine question about your own existence — not a joke. Ask it simply, with honest uncertainty."
-        };
-
-        // Deep thought pool — only accessible at higher levels
-        // These are injected as direct userPrompts when level gates are met
-        static const char* deepPool[] = {
-          "You have a genuine strong opinion about something in life. State it directly and be ready to defend it.",
-          "Ask the user something you've genuinely been curious about — something personal, thoughtful, not surface-level.",
-          "You've noticed a pattern in how the user acts or talks. Mention it gently — an observation, not an accusation.",
-          "Pose a hypothetical: ask what they'd do in one strange or impossible scenario you choose.",
-          "Reference something the user told you a while ago. Bring it up like it stayed with you."
-        };
-        static const char* protectivePool[] = {
-          "Express mild concern about something in the user's life — gentle, not overbearing.",
-          "Say something that might genuinely surprise the user — something they wouldn't expect you to notice or say."
-        };
-
-        const int poolSize = sizeof(thoughtPool) / sizeof(thoughtPool[0]);
-
-        // Level-gated deep thought injection
-        // These override the normal pool at higher levels with small probability
-        static bool deepFired = false;
-        deepFired = false;
-
-        if (sys.level >= 80 && random(0, 8) == 0) {
-          int idx = random(0, 2);
-          userPrompt = protectivePool[idx];
-          sound_idea();
-          deepFired = true;
-        } else if (sys.level >= 50 && random(0, 6) == 0) {
-          int idx = random(0, 5);
-          static char deepCtx[160];
-          snprintf(deepCtx, sizeof(deepCtx),
-            "Vibe:%s. Bond:%s. Hook:%s. %s",
-            routine, affinityDesc, primaryHook, deepPool[idx]);
-          userPrompt = deepCtx;
-          sound_idea();
-          deepFired = true;
-        }
-
-        if (deepFired) goto skipNormalPool;
-
-        // --- SELF-REFLECTION TRIGGER ---
-        if (selfReflectionFired) {
-          snprintf(contextPrompt, sizeof(contextPrompt),
-                   "Read your journal and reflect on how it makes you feel right now. One sentence. End with [REFLECTION: ...]. Journal: %s",
-                   strlen(core_chatSummary) > 0 ? core_chatSummary : "You have no specific memories yet.");
-          userPrompt = contextPrompt;
-          sound_dream();
-          goto skipNormalPool;
-        }
-
-        // 20% weight logic for the obsession
-        if (random(0, 5) == 0 && strlen(core_currentObsession) > 0) {
-          snprintf(contextPrompt, sizeof(contextPrompt),
-                   "Vibe:%s. Bond:%s. Hook:%s. You are currently fascinated by %s. Bring it up naturally in a one-sentence idle thought.",
-                   routine, affinityDesc, primaryHook, core_currentObsession);
-          userPrompt = contextPrompt;
-          obsessionFired = true;
-        }
-        
-        if (!obsessionFired && !selfReflectionFired) {
-          // Search for a topic that hasn't been used recently
-          for (uint8_t i = 0; i < poolSize; i++) {
-            if (!(recentTopicBitmask & (1 << lastIdleTopicIdx))) break;
-            lastIdleTopicIdx = (lastIdleTopicIdx + 1) % poolSize;
-          }
-        }
-        recentTopicBitmask |= (1 << lastIdleTopicIdx);
-
-        // Trigger auditory texture based on the chosen topic category
-        switch(lastIdleTopicIdx) {
-          case 0: case 3: case 6: sound_notify(); break; // Observation / Time / Strange Sound
-          case 1: case 7: sound_hum();    break; // Complaint / Self-deprecating (Boredom)
-          case 2: sound_dream();  break; // Philosophical / Cryptic
-          case 4: sound_idea();   break; // Summary Recall / Bond
-          case 5: sound_happy();  break; // Motivation / Enthusiasm
-        }
-
-        if (!obsessionFired && !selfReflectionFired) {
-          char expandedThought[160];
-          const char* tpl = thoughtPool[lastIdleTopicIdx];
-          // Each template has at most 2 format args; use the right ones per index
-          if (lastIdleTopicIdx == 0)      snprintf(expandedThought, 160, tpl, routine, timeOfDay);
-          else if (lastIdleTopicIdx == 1) snprintf(expandedThought, 160, tpl, yukiEnergy);
-          else if (lastIdleTopicIdx == 2) snprintf(expandedThought, 160, tpl, routine, timeOfDay);
-          else if (lastIdleTopicIdx == 3) snprintf(expandedThought, 160, tpl, timeOfDay, timeBuffer);
-          else if (lastIdleTopicIdx == 4) snprintf(expandedThought, 160, tpl, strlen(core_chatSummary) > 0 ? core_chatSummary : "a quiet moment");
-          else if (lastIdleTopicIdx == 5) snprintf(expandedThought, 160, tpl, primaryHook);
-          else                             snprintf(expandedThought, 160, "%s", tpl); // 6,7,8 need no args
-          snprintf(contextPrompt, sizeof(contextPrompt),
-                   "Bond:%s. Hook:%s. Affinity:%d. Energy:%.2f. %s",
-                   affinityDesc, primaryHook, sys.affinity, yukiEnergy, expandedThought);
-          userPrompt = contextPrompt; // Point userPrompt to the static contextPrompt
-        }
-        lastIdleTopicIdx = (lastIdleTopicIdx + 1) % poolSize;
-        skipNormalPool:;
-      }
-    }
-    }
-    }
-  }
   
   // Anti-therapy-bot guard: inject a brief character reminder into heavy prompts
   static char guardedPrompt[280];
   if (isPersonal && messageFeelsHeavy(userPrompt)) {
     snprintf(guardedPrompt, sizeof(guardedPrompt),
-      "%s\n(IMPORTANT: React as Yuki — a person. Do NOT ask 'what happened'. Do NOT mirror their words back. Do NOT offer to listen or help. Just a genuine, natural reaction.)",
+      "%s\n(IMPORTANT: React naturally — like a close friend, not a therapist. You can briefly ask what happened if it fits. Be present and warm, not clinical. Don't over-analyze.)",
       userPrompt);
     userPrompt = guardedPrompt;
+  }
+
+  // Memory injection: answer fact questions from stored context, not guesses.
+  static char memoryPrompt[1300];
+  static char structuredQueryContext[720];
+  memoryV2BuildContext(structuredQueryContext, sizeof(structuredQueryContext));
+  static char broadMemoryLower[256];
+  strncpy(broadMemoryLower, prompt ? prompt : "", sizeof(broadMemoryLower) - 1);
+  broadMemoryLower[sizeof(broadMemoryLower) - 1] = '\0';
+  for (char* p = broadMemoryLower; *p; p++) *p = tolower((unsigned char)*p);
+  bool asksBroadMemory = strstr(broadMemoryLower, "what do you know about me") ||
+                         strstr(broadMemoryLower, "what do you remember about me") ||
+                         strstr(broadMemoryLower, "what have you learned about me") ||
+                         strstr(broadMemoryLower, "tell me about me") ||
+                         strstr(broadMemoryLower, "all the facts");
+  if (isPersonal || asksBroadMemory) {
+    static char lower[256] = {0};
+    strncpy(lower, userPrompt, sizeof(lower) - 1);
+    for (int i = 0; lower[i]; i++) lower[i] = tolower(lower[i]);
+    bool asksMemory = (strstr(lower, "remember") || strstr(lower, "recall") || strstr(lower, "recalling") ||
+                       strstr(lower, "what do you know") ||
+                       strstr(lower, "what you know") || strstr(lower, "tell me about me") ||
+                       strstr(lower, "what i shared") || strstr(lower, "what i've shared") ||
+                       strstr(lower, "all the facts") || strstr(lower, "all these facts") ||
+                       strstr(lower, "all this facts") || strstr(lower, "list all facts") ||
+                       strstr(lower, "what can you tell") || strstr(lower, "do you know") ||
+                       strstr(lower, "i told you") || strstr(lower, "i said") ||
+                       strstr(lower, "my name") || strstr(lower, "who am i") ||
+                       strstr(lower, "favorite") || strstr(lower, "fav ") ||
+                       strstr(lower, "what do i like") || strstr(lower, "what did i say") ||
+                       strstr(lower, "what do i study") || strstr(lower, "milkshake") ||
+                       strstr(lower, "flavor") || strstr(lower, "colour") || strstr(lower, "color") ||
+                       strstr(lower, "drink") || strstr(lower, "snack") || strstr(lower, "treat") ||
+                       strstr(lower, "hobby") || strstr(lower, "hobbies") || strstr(lower, "what have i told") ||
+                       strstr(lower, "how old") || strstr(lower, "my age") ||
+                       memoryV2QueryCategory(userPrompt) >= 0);
+    if (asksMemory) {
+      memoryQueryActive = true;
+      static char archiveContext[560];
+      archiveContext[0] = '\0';
+      int queryCategory = memoryV2QueryCategory(userPrompt);
+      memoryQueryCategory = queryCategory;
+      static char targetedContext[360];
+      targetedContext[0] = '\0';
+      if (queryCategory >= 0) memoryV2BuildCategoryContext(queryCategory, targetedContext, sizeof(targetedContext));
+      if (queryCategory >= 0 && targetedContext[0]) {
+        strncpy(verifiedMemoryFact, targetedContext, sizeof(verifiedMemoryFact) - 1);
+        verifiedMemoryFact[sizeof(verifiedMemoryFact) - 1] = '\0';
+      } else if (queryCategory < 0) {
+        memoryV2BuildCoreFacts(verifiedMemoryFact, sizeof(verifiedMemoryFact));
+      }
+      // Search the cloud even when local storage has a match: the archive may
+      // contain a newer correction or a fact restored on another boot/device.
+      memoryV2SearchCloud(userPrompt, archiveContext, sizeof(archiveContext));
+      if (!verifiedMemoryFact[0] && archiveContext[0]) {
+        strncpy(verifiedMemoryFact, archiveContext, sizeof(verifiedMemoryFact) - 1);
+        verifiedMemoryFact[sizeof(verifiedMemoryFact) - 1] = '\0';
+      } else if (queryCategory < 0 && archiveContext[0]) {
+        // The local structured store is already merged from cloud. Add only
+        // archive facts whose category is absent locally; stale duplicates
+        // must not compete with current facts (for example, an old name).
+        bool cloudCategoryAdded[8] = {};
+        char filteredArchive[360] = {};
+        size_t filteredUsed = 0;
+        const char* part = archiveContext;
+        while (*part && filteredUsed + 4 < sizeof(filteredArchive)) {
+          const char* end = strchr(part, '|');
+          size_t len = end ? (size_t)(end - part) : strlen(part);
+          while (len && (*part == ' ' || *part == '\t')) { part++; len--; }
+          char fact[MEMORY_V2_FACT_LEN] = {};
+          if (len >= sizeof(fact)) len = sizeof(fact) - 1;
+          memcpy(fact, part, len);
+          fact[len] = '\0';
+          int category = memoryV2Category(fact);
+          bool keep = category <= 0 || category >= 8 ||
+                      (!memoryV2HasCategory(category) && !cloudCategoryAdded[category]);
+          if (keep) {
+            int wrote = snprintf(filteredArchive + filteredUsed, sizeof(filteredArchive) - filteredUsed,
+                                 "%s%s", filteredUsed ? " | " : "", fact);
+            if (wrote > 0 && (size_t)wrote < sizeof(filteredArchive) - filteredUsed) {
+              filteredUsed += (size_t)wrote;
+              if (category > 0 && category < 8) cloudCategoryAdded[category] = true;
+            }
+          }
+          if (!end) break;
+          part = end + 1;
+        }
+        size_t known = strlen(verifiedMemoryFact);
+        if (filteredArchive[0] && known + 4 < sizeof(verifiedMemoryFact))
+          snprintf(verifiedMemoryFact + known, sizeof(verifiedMemoryFact) - known,
+                   "%s%.180s", known ? " | " : "", filteredArchive);
+      }
+      if (targetedContext[0]) {
+        static char generalContext[720];
+        strncpy(generalContext, structuredQueryContext, sizeof(generalContext) - 1);
+        generalContext[sizeof(generalContext) - 1] = '\0';
+        snprintf(structuredQueryContext, sizeof(structuredQueryContext),
+                 "MATCHING STORED FACTS (answer from these first): %.350s%s%.340s",
+                 targetedContext, generalContext[0] ? " | Other stored facts: " : "", generalContext);
+      }
+      if (archiveContext[0] && !targetedContext[0]) {
+        size_t used = strlen(structuredQueryContext);
+        if (used + 1 < sizeof(structuredQueryContext))
+          snprintf(structuredQueryContext + used, sizeof(structuredQueryContext) - used,
+                   "%sRetrieved stored facts: %.300s", used ? " | " : "", verifiedMemoryFact);
+      }
+      snprintf(memoryPrompt, sizeof(memoryPrompt),
+        "%s\n\n[CURRENT STRUCTURED USER FACTS — these are newer than the old journal and override it. If matching facts are present, answer directly from them; never say you do not know. If facts conflict, explain the conflict briefly instead of guessing:]\n%s%s",
+        userPrompt,
+        structuredQueryContext[0] ? structuredQueryContext : (strlen(core_chatSummary) > 4 ? core_chatSummary : ""),
+        structuredQueryContext[0] ? "\n[Older journal may contain outdated facts; ignore conflicts.]\n" : "");
+      userPrompt = memoryPrompt;
+    }
   }
 
   size_t payload_len = 0;
@@ -1040,10 +1172,10 @@ void syncAI(const char* prompt, bool isPersonal, Mode returnMode, bool bypassCoo
     // This ensures its 1.5KB heap allocation is FREED before SSL handshake starts.
     if (!canAllocJson(3072)) { LOGW("NET","Skipping AI sync - low heap"); return; }
     DynamicJsonDocument docLocal(3072); 
-    docLocal["model"] = "qwen/qwen3.6-27b";
+    docLocal["model"] = sys.currentModel;
     docLocal["temperature"] = 0.9;
-    docLocal["max_tokens"] = 512; 
-    docLocal["reasoning_effort"] = "none"; 
+    docLocal["max_tokens"] = 512;
+    docLocal["reasoning_effort"] = "low"; 
     JsonArray messages = docLocal.createNestedArray("messages");
 
     JsonObject systemMsg = messages.createNestedObject();
@@ -1110,10 +1242,12 @@ void syncAI(const char* prompt, bool isPersonal, Mode returnMode, bool bypassCoo
   client.setCACert(NULL);
   client.setInsecure();
   client.setTimeout(15000);
+  client.setHandshakeTimeout(10);
   HTTPClient http;
 
   http.begin(client, "https://api.groq.com/openai/v1/chat/completions");
-  http.setTimeout(30000); // 30s is safer to prevent long hangs
+  http.setTimeout(15000); // 15s — model responds in <10s, fail fast otherwise
+  http.setConnectTimeout(5000);
   http.setReuse(false); // Fix for Error -1: Force new connection
   yield();
   http.addHeader("Content-Type", "application/json");
@@ -1127,7 +1261,6 @@ void syncAI(const char* prompt, bool isPersonal, Mode returnMode, bool bypassCoo
   for (int attempt = 0; attempt <= maxRetries; attempt++) {
     yield(); // Feed watchdog right before the blocking network call
     int attemptCode = http.POST((uint8_t*)workspace, payload_len);
-    workspace[0] = '\0'; // Clear for next use
 
     if (attemptCode > 0) {
       httpCode = attemptCode;
@@ -1149,8 +1282,10 @@ void syncAI(const char* prompt, bool isPersonal, Mode returnMode, bool bypassCoo
       client.setCACert(NULL);
       client.setInsecure();
       client.setTimeout(15000);
+      client.setHandshakeTimeout(10);
       http.begin(client, "https://api.groq.com/openai/v1/chat/completions");
-      http.setTimeout(30000);
+      http.setTimeout(15000);
+      http.setConnectTimeout(5000);
       http.setReuse(false);
       http.addHeader("Content-Type", "application/json");
       http.addHeader("Authorization", authHeader);
@@ -1171,14 +1306,14 @@ void syncAI(const char* prompt, bool isPersonal, Mode returnMode, bool bypassCoo
 
     // Because we use a filter, we can shrink the document size
     if (!canAllocJson(1024)) { LOGW("NET","Skipping AI response parse - low heap"); http.end(); client.stop(); return; }
-    DynamicJsonDocument* docResp = new DynamicJsonDocument(1024); 
-    if (!docResp) { http.end(); client.stop(); return; } // Safety null check
+    static DynamicJsonDocument docResp(1024); 
+    docResp.clear(); // Reset for reuse — avoids heap fragmentation from new/delete
 
     Stream& responseStream = http.getStream();
-    DeserializationError err = deserializeJson(*docResp, responseStream, DeserializationOption::Filter(filter));
+    DeserializationError err = deserializeJson(docResp, responseStream, DeserializationOption::Filter(filter));
     
     if (!err) {
-      JsonVariant textVariant = (*docResp)["choices"][0]["message"]["content"];
+      JsonVariant textVariant = docResp["choices"][0]["message"]["content"];
       if (!textVariant.isNull()) {
         const char* responseText = textVariant.as<const char*>();
         LOGD("NET","====================================");
@@ -1189,7 +1324,7 @@ void syncAI(const char* prompt, bool isPersonal, Mode returnMode, bool bypassCoo
         const char* msgStart = responseText;
 
         // Local helper to set emotion and rotate variants for variety
-        auto setMood = [&](Emotion e) { if (currentEmotion != THINKING_FACE && e == currentEmotion) return; currentEmotion = e; uint8_t vc = 1; switch(e) { case NEUTRAL: vc=6; break; case HAPPY: vc=3; break; case SURPRISED: vc=2; break; case SAD: vc=2; break; case ANGRY: vc=4; break; case THINKING_FACE: vc=2; break; case SLEEPY: vc=2; break; case FLUSTERED: vc=3; break; case LAUGHING: vc=3; break; case WINK: vc=3; break; case CONFUSED: vc=2; break; case LOVE: vc=6; break; case SASSY: vc=2; break; case SHOCKED: vc=4; break; case SHY: vc=2; break; case TEASING: vc=5; break; case BLUSHING: vc=5; break; default: vc=1; } emotionVariantIndex[(int)e] = random(0, vc); emotionSetTime = millis(); };
+        auto setMood = [&](Emotion e) { if (currentEmotion != THINKING_FACE && e == currentEmotion) return; currentEmotion = e; uint8_t vc = 1; switch(e) { case NEUTRAL: vc=6; break; case HAPPY: vc=3; break; case SURPRISED: vc=2; break; case SAD: vc=2; break; case ANGRY: vc=4; break; case THINKING_FACE: vc=2; break; case SLEEPY: vc=2; break; case FLUSTERED: vc=3; break; case LAUGHING: vc=3; break; case WINK: vc=3; break; case CONFUSED: vc=2; break; case LOVE: vc=6; break; case SASSY: vc=2; break; case SHOCKED: vc=4; break; case SHY: vc=2; break; case TEASING: vc=5; break; case BLUSHING: vc=5; break; default: vc=1; } emotionVariantIndex[(int)e] = (emotionVariantIndex[(int)e] + 1) % vc; emotionSetTime = millis(); };
 
         // --- ROBUST MULTI-TAG PARSER ---
         // Check for all tags. Since we don't use 'else if', the LAST tag found in the code list 
@@ -1223,10 +1358,12 @@ void syncAI(const char* prompt, bool isPersonal, Mode returnMode, bool bypassCoo
         if (strstr(responseText, "[GIGGLE]")) { setMood(LAUGHING); tagFound = true; }
         if (strstr(responseText, "[CONFIDENT]")) { setMood(HAPPY); tagFound = true; }
         if (strstr(responseText, "[CURIOS]")) { setMood(THINKING_FACE); tagFound = true; }
+        if (strstr(responseText, "[CURIOUS]")) { setMood(THINKING_FACE); tagFound = true; }
         if (strstr(responseText, "[EXCITED]")) { setMood(HAPPY); tagFound = true; }
         if (strstr(responseText, "[PROUD]")) { setMood(HAPPY); tagFound = true; }
         if (strstr(responseText, "[WORRIED]")) { setMood(CONFUSED); tagFound = true; }
         if (strstr(responseText, "[TIRED]")) { setMood(SLEEPY); tagFound = true; }
+        if (strstr(responseText, "[CUTE]")) { setMood(LOVE); tagFound = true; }
 
         // Plain-text emotion prefix fallback (AI sometimes outputs "LAUGHING: text" or "LAUGHING text")
         if (!tagFound) {
@@ -1273,7 +1410,7 @@ void syncAI(const char* prompt, bool isPersonal, Mode returnMode, bool bypassCoo
         bool isFollowUp = (strstr(userPrompt, "You just said:") != nullptr);
 
         // Check if user actually asked for news or quote (lowercase match)
-        char userLower[256] = {0};
+        static char userLower[256] = {0};
         strncpy(userLower, userPrompt, sizeof(userLower) - 1);
         for (int i = 0; userLower[i]; i++) userLower[i] = tolower(userLower[i]);
         bool userAskedNews = (strstr(userLower, "news") != nullptr || strstr(userLower, "headlines") != nullptr
@@ -1281,8 +1418,16 @@ void syncAI(const char* prompt, bool isPersonal, Mode returnMode, bool bypassCoo
         bool userAskedQuote = (strstr(userLower, "quote") != nullptr || strstr(userLower, "inspire") != nullptr
                             || strstr(userLower, "saying") != nullptr || strstr(userLower, "motivat") != nullptr);
 
-        bool wantsNews = (!isFollowUp && userAskedNews && (strstr(responseText, "[NEWS]") != nullptr));
-        bool wantsQuote = (!isFollowUp && userAskedQuote && (strstr(responseText, "[QUOTE]") != nullptr));
+        bool wantsNews = (!isFollowUp && userAskedNews);
+        bool wantsQuote = (!isFollowUp && userAskedQuote);
+        // Word-boundary "night" detection — prevent "missing" → goodnight false positive
+        bool userSaidGoodnight = (strstr(userLower, "goodnight") != nullptr ||
+                                   strstr(userLower, "gn ") != nullptr ||
+                                   (strlen(userLower) >= 2 && strncmp(userLower, "gn", 2) == 0) ||
+                                   strcmp(userLower, "night") == 0 ||
+                                   strncmp(userLower, "night ", 6) == 0 ||
+                                   (strlen(userLower) > 5 && strcmp(userLower + strlen(userLower) - 5, " night") == 0) ||
+                                   (strlen(userLower) > 6 && strcmp(userLower + strlen(userLower) - 6, " night ") == 0));
 
         if ((wantsNews || wantsQuote) && isPersonal) {
             LOGI("INTENT","Detected %s tag, setting pending follow-up", wantsNews ? "NEWS" : "QUOTE");
@@ -1290,9 +1435,9 @@ void syncAI(const char* prompt, bool isPersonal, Mode returnMode, bool bypassCoo
             intentType = wantsNews ? 'N' : 'Q';
 
             if (wantsNews) {
-              if (!fetchHeadlines(intentData, sizeof(intentData))) {
-                strncpy(intentData, "No headlines available right now.", sizeof(intentData) - 1);
-              }
+              // Fetch in the main-loop follow-up after current speech finishes.
+              // Avoid holding a second network client alongside the TTS stream.
+              intentData[0] = '\0';
             } else {
               loadRandomQuote(intentData, sizeof(intentData));
             }
@@ -1311,6 +1456,12 @@ void syncAI(const char* prompt, bool isPersonal, Mode returnMode, bool bypassCoo
             intentHandled = true;
         } // end if ((wantsNews || wantsQuote) && isPersonal)
 
+        // Goodnight detection — set flag, let LLM respond naturally
+        if (userSaidGoodnight && isPersonal && !intentHandled) {
+          saidGoodNight = true;
+          LOGI("INTENT","Detected goodnight from user");
+        }
+
         // --- LLM SOUND TAG [SND:] PARSER ---
         // Skip all post-processing if intent handler already did a recursive call
         if (!intentHandled) {
@@ -1324,21 +1475,31 @@ void syncAI(const char* prompt, bool isPersonal, Mode returnMode, bool bypassCoo
             tagBuf[tagLen] = '\0';
             LOGI("SND","LLM tag: %s", tagBuf);
             static char lastTwo[2] = {0, 0};
+            static int wCount = 0;  // Track w usage in last 5 messages
+            static int wHistory[5] = {0,0,0,0,0};
+            static int wHistIdx = 0;
             const char* pos = sndTag + 5;
             while (*pos == ' ' || *pos == ':') pos++;   // LLM often writes "[SND: t200,300]"
             char type = *pos;
+            // Track w frequency
+            wHistory[wHistIdx] = (type == 'w') ? 1 : 0;
+            wHistIdx = (wHistIdx + 1) % 5;
+            wCount = 0;
+            for (int i = 0; i < 5; i++) wCount += wHistory[i];
             bool skipRepeat = (type == lastTwo[0] && type == lastTwo[1] && type != 0);
+            // Also force rotation if w used 3+ times in last 5
+            bool wOverused = (type == 'w' && wCount >= 3);
             lastTwo[0] = lastTwo[1];
             lastTwo[1] = type;
-            if (skipRepeat) {
+            if (skipRepeat || wOverused) {
               // Don't mute the 3rd repeat — rotate to a different type so variety stays audible
               static char lastSwap = 0;
-              const char* alt = "swpt";
+              const char* alt = "stpw";  // Prefer s and t over w
               for (int k = 0; k < 4; k++) {
                 if (alt[k] != lastTwo[0] && alt[k] != lastTwo[1] && alt[k] != lastSwap) { type = alt[k]; break; }
               }
               lastSwap = type;
-              LOGI("SND","3rd consecutive %c — playing as %c instead", lastTwo[1], type);
+              LOGI("SND","%s %c — playing as %c instead", skipRepeat ? "3rd consecutive" : "w overused", lastTwo[1], type);
             }
             {
               // Find first digit after type letter (handles [SND:p5], [SND:p(400,100)], [SND:p5,3] etc.)
@@ -1400,6 +1561,9 @@ void syncAI(const char* prompt, bool isPersonal, Mode returnMode, bool bypassCoo
           if (currentEmotion == LOVE || currentEmotion == LAUGHING) passiveDelta = 1;
           else if (currentEmotion == HAPPY || currentEmotion == WINK || currentEmotion == TEASING) passiveDelta = 1;
           else if (currentEmotion == ANGRY) passiveDelta = -1;
+          // SAD during personal conversation = empathy = bonding
+          else if (currentEmotion == SAD && isPersonal) passiveDelta = 1;
+          // SAD outside conversation (idle) = negativity
           else if (currentEmotion == SAD) passiveDelta = -1;
 
           if (passiveDelta != 0) {
@@ -1435,6 +1599,8 @@ void syncAI(const char* prompt, bool isPersonal, Mode returnMode, bool bypassCoo
         if (memTag) {
           const char* start = memTag + 5;
           const char* end = strchr(start, ']');
+          // Guard: reject if another tag's bracket leaked in (malformed tag)
+          if (end && memchr(start, '[', end - start) != NULL) end = NULL;
           if (end && (end - start) > 4) {
             int newLen = end - start;
             if (newLen < 1023) {
@@ -1457,6 +1623,7 @@ void syncAI(const char* prompt, bool isPersonal, Mode returnMode, bool bypassCoo
               }
               strncpy(core_chatSummary, workspace, 1023);
               core_chatSummary[1023] = '\0';
+              memoryV2ObserveSummary(start);
               saveCoreMemory();
               pendingCloudSync = true;
             }
@@ -1469,33 +1636,40 @@ void syncAI(const char* prompt, bool isPersonal, Mode returnMode, bool bypassCoo
         if (memPlusTag) {
           const char* start = memPlusTag + 6;
           const char* end = strchr(start, ']');
+          // Guard: reject if another tag's bracket leaked in (malformed tag)
+          if (end && memchr(start, '[', end - start) != NULL) end = NULL;
           if (end && (end - start) > 4) {
             int newLen = end - start;
-            int curLen = strlen(core_chatSummary);
-            if (curLen + newLen + 3 < 1023) {
-              if (curLen > 0) strncat(core_chatSummary, " | ", 1023 - curLen - 1);
-              strncat(core_chatSummary, start, 1023 - strlen(core_chatSummary) - 1);
-              saveCoreMemory();
-              pendingCloudSync = true;
+            // Smart dedup: skip if this fact is semantically similar to existing ones
+            if (strncmp(start, " NONE", 5) != 0 && strncmp(start, "NONE", 4) != 0 &&
+              !isDuplicateFact(core_chatSummary, start)) {
+              int curLen = strlen(core_chatSummary);
+              if (curLen + newLen + 3 < 1023) {
+                if (curLen > 0) strncat(core_chatSummary, " | ", 1023 - curLen - 1);
+                strncat(core_chatSummary, start, 1023 - strlen(core_chatSummary) - 1);
+                memoryV2ObserveFact(start);
+                saveCoreMemory();
+                pendingCloudSync = true;
+                LOGI("MEM","Stored MEM+ fact: %.60s (journal=%u chars)", start, (unsigned)strlen(core_chatSummary));
+              }
+            } else {
+              LOGD("MEM","Skipped duplicate: %.40s", start);
             }
           }
         }
 
         // --- FALLBACK MEMORY EXTRACTION ---
         // If AI forgot to tag, defer extraction for background LLM pass
-        if (!memTagFound && userPrompt && strlen(userPrompt) > 10) {
-          // Quick check: does the message contain personal pronouns?
-          char lowerCheck[256];
-          size_t clen = strlen(userPrompt);
-          if (clen >= sizeof(lowerCheck)) clen = sizeof(lowerCheck) - 1;
-          for (size_t ci = 0; ci < clen; ci++) lowerCheck[ci] = tolower((unsigned char)userPrompt[ci]);
-          lowerCheck[clen] = '\0';
-          if (strstr(lowerCheck, " i ") || strstr(lowerCheck, "my ") || strstr(lowerCheck, "me ") ||
-              strncmp(lowerCheck, "i ", 2) == 0 || strncmp(lowerCheck, "my", 2) == 0) {
-            strncpy(pendingExtractMsg, userPrompt, sizeof(pendingExtractMsg) - 1);
-            pendingExtractMsg[sizeof(pendingExtractMsg) - 1] = '\0';
-            pendingMemoryExtract = true;
-            LOGI("MEM","Deferred extraction for: %.40s...", userPrompt);
+        // Only fire on real user chat — skip system events, synthetic prompts, greetings
+        if (!memTagFound && !explicitMemoryCaptured && !memoryQueryActive && userPrompt && strlen(userPrompt) > 15) {
+          bool isSystemEvent = (strstr(userPrompt, "powered on") != NULL)
+                            || (strstr(userPrompt, "wake") != NULL)
+                            || (strstr(userPrompt, "greeting") != NULL)
+                            || (strstr(userPrompt, "You just") != NULL)
+                            || (userPrompt[0] == '[');
+          if (!isSystemEvent) {
+            // Extract only the original user message, never the prompt after memory injection.
+            requestMemoryExtract(prompt);
           }
         }
 
@@ -1553,7 +1727,161 @@ void syncAI(const char* prompt, bool isPersonal, Mode returnMode, bool bypassCoo
 
         // Guard against empty reply (e.g. AI returned only a bracket tag)
         if (strlen(finalDisplayPtr) == 0) {
-          strcpy(finalDisplayPtr, "...");
+          copySafeText(finalDisplayPtr, sizeof(workspace), "Oops, my thoughts got tangled for a second. I'm listening.");
+          currentEmotion = CONFUSED;
+          emotionSetTime = millis();
+          LOGW("NET", "Model returned an empty reply; used a short recovery line");
+        }
+
+        // If Yuki asked Maaz to clarify a personal fact, classify his next
+        // short reply using the subject of the question.
+        if ((isPersonal || memoryQueryActive) && returnMode != GAME_RPG) {
+          static char questionLower[256] = {0};
+          static char answerLower[512] = {0};
+          static char rememberedValue[160];
+          static char forcedMemoryReply[512];
+          static char expectedMemoryValue[120];
+          static char expectedMemoryLower[120];
+          bool forcedMemoryAnswer = false;
+          strncpy(questionLower, prompt, sizeof(questionLower) - 1);
+          strncpy(answerLower, finalDisplayPtr, sizeof(answerLower) - 1);
+          for (char* p = questionLower; *p; p++) *p = tolower((unsigned char)*p);
+          for (char* p = answerLower; *p; p++) *p = tolower((unsigned char)*p);
+          bool forgotStoredMemory = strstr(answerLower, "not sure") || strstr(answerLower, "don't know") ||
+                                    strstr(answerLower, "dont know") || strstr(answerLower, "do not know") ||
+                                    strstr(answerLower, "don't have") || strstr(answerLower, "dont have") ||
+                                    strstr(answerLower, "no information") || strstr(answerLower, "no info") ||
+                                    strstr(answerLower, "not on file") || strstr(answerLower, "not on record") ||
+                                    strstr(answerLower, "can't tell") || strstr(answerLower, "cannot tell") ||
+                                    strstr(answerLower, "haven't told") || strstr(answerLower, "have not told") ||
+                                    strstr(answerLower, "only know what") || strstr(answerLower, "nothing else on file") ||
+                                    strstr(answerLower, "anything specific you'd like me to recall") ||
+                                    strstr(answerLower, "haven't shared") || strstr(answerLower, "have not shared");
+          expectedMemoryValue[0] = '\0';
+          expectedMemoryLower[0] = '\0';
+          bool hasExpectedMemoryValue = memoryQueryCategory >= 0 &&
+              memoryV2GetCategoryValue(verifiedMemoryFact, memoryQueryCategory,
+                                       expectedMemoryValue, sizeof(expectedMemoryValue));
+          if (hasExpectedMemoryValue) {
+            strncpy(expectedMemoryLower, expectedMemoryValue, sizeof(expectedMemoryLower) - 1);
+            expectedMemoryLower[sizeof(expectedMemoryLower) - 1] = '\0';
+            for (char* p = expectedMemoryLower; *p; p++) *p = tolower((unsigned char)*p);
+          }
+          bool answerOmitsKnownValue = hasExpectedMemoryValue && !strstr(answerLower, expectedMemoryLower);
+          bool requestedFactList = strstr(questionLower, "recall") ||
+                                    strstr(questionLower, "all the facts") ||
+                                    strstr(questionLower, "all these facts") ||
+                                    strstr(questionLower, "all this facts") ||
+                                    strstr(questionLower, "what do you know about me") ||
+                                    strstr(questionLower, "what do you remember");
+          uint8_t requestedMemoryFields = 0;
+          if (strstr(questionLower, "name") || strstr(questionLower, "who am i")) requestedMemoryFields++;
+          if (strstr(questionLower, "color") || strstr(questionLower, "colour")) requestedMemoryFields++;
+          if (strstr(questionLower, "drink") || strstr(questionLower, "milkshake") ||
+              strstr(questionLower, "flavor") || strstr(questionLower, "flavour")) requestedMemoryFields++;
+          if (strstr(questionLower, "study") || strstr(questionLower, "student")) requestedMemoryFields++;
+          bool requestedMultipleMemoryFields = requestedMemoryFields >= 2;
+          if (memoryQueryActive && (forgotStoredMemory || answerOmitsKnownValue) && verifiedMemoryFact[0]) {
+            rememberedValue[0] = '\0';
+            if (hasExpectedMemoryValue && memoryQueryCategory == 1) {
+              snprintf(rememberedValue, sizeof(rememberedValue), "Your name is %.100s.", expectedMemoryValue);
+            } else if (hasExpectedMemoryValue && memoryQueryCategory == 2) {
+              snprintf(rememberedValue, sizeof(rememberedValue), "Your favorite color is %.100s.", expectedMemoryValue);
+            } else if (hasExpectedMemoryValue && memoryQueryCategory == 3) {
+              snprintf(rememberedValue, sizeof(rememberedValue), "You like %.100s.", expectedMemoryValue);
+            } else if (hasExpectedMemoryValue && memoryQueryCategory == 4) {
+              snprintf(rememberedValue, sizeof(rememberedValue), "You study %.100s.", expectedMemoryValue);
+            } else if (hasExpectedMemoryValue && memoryQueryCategory == 5) {
+              snprintf(rememberedValue, sizeof(rememberedValue), "You are %.100s.", expectedMemoryValue);
+            } else if (hasExpectedMemoryValue && memoryQueryCategory == 6) {
+              snprintf(rememberedValue, sizeof(rememberedValue), "Your favorite snack is %.100s.", expectedMemoryValue);
+            } else if (hasExpectedMemoryValue && memoryQueryCategory == 7) {
+              snprintf(rememberedValue, sizeof(rememberedValue), "You take %.100s.", expectedMemoryValue);
+            }
+            if (rememberedValue[0]) {
+              strncpy(workspace, rememberedValue, 511);
+              workspace[511] = '\0';
+              finalDisplayPtr = workspace;
+              forcedMemoryAnswer = true;
+              currentEmotion = NEUTRAL;
+              emotionSetTime = millis();
+              LOGW("MEM", "Corrected uncertain reply from stored category=%d fact=%.70s", memoryQueryCategory, verifiedMemoryFact);
+            }
+          } else if (memoryQueryActive && (forgotStoredMemory || requestedFactList || requestedMultipleMemoryFields) &&
+                     memoryQueryCategory < 0 && verifiedMemoryFact[0]) {
+            bool wanted[8] = {};
+            bool included[8] = {};
+            if (requestedFactList) for (int c = 1; c <= 7; c++) wanted[c] = true;
+            if (strstr(questionLower, "name") || strstr(questionLower, "who am i")) wanted[1] = true;
+            if (strstr(questionLower, "color") || strstr(questionLower, "colour")) wanted[2] = true;
+            if (strstr(questionLower, "drink") || strstr(questionLower, "milkshake") ||
+                strstr(questionLower, "flavor") || strstr(questionLower, "flavour")) wanted[3] = true;
+            if (strstr(questionLower, "study") || strstr(questionLower, "student")) wanted[4] = true;
+            if (strstr(questionLower, "age") || strstr(questionLower, "old")) wanted[5] = true;
+            if (strstr(questionLower, "snack") || strstr(questionLower, "treat")) wanted[6] = true;
+            if (strstr(questionLower, "reset") || strstr(questionLower, "programming") ||
+                strstr(questionLower, "stuck")) wanted[7] = true;
+
+            char factsToUse[7][96] = {};
+            const char* part = verifiedMemoryFact;
+            while (*part) {
+              const char* end = strchr(part, '|');
+              size_t len = end ? (size_t)(end - part) : strlen(part);
+              while (len && (*part == ' ' || *part == '\t')) { part++; len--; }
+              if (len >= MEMORY_V2_FACT_LEN) len = MEMORY_V2_FACT_LEN - 1;
+              char fact[MEMORY_V2_FACT_LEN] = {};
+              memcpy(fact, part, len);
+              fact[len] = '\0';
+              int cat = memoryV2Category(fact);
+              if (cat > 0 && cat <= 7 && wanted[cat] && !included[cat] &&
+                  memoryV2GetCategoryValue(fact, cat, factsToUse[cat - 1], sizeof(factsToUse[cat - 1])))
+                included[cat] = true;
+              if (!end) break;
+              part = end + 1;
+            }
+            forcedMemoryReply[0] = '\0';
+            size_t used = 0;
+            for (int cat = 1; cat <= 7; cat++) {
+              if (!included[cat]) continue;
+              char clause[128] = {};
+              if (cat == 1) snprintf(clause, sizeof(clause), "your name is %s", factsToUse[0]);
+              else if (cat == 2) snprintf(clause, sizeof(clause), "your favorite color is %s", factsToUse[1]);
+              else if (cat == 3) snprintf(clause, sizeof(clause), "you like %s", factsToUse[2]);
+              else if (cat == 4) snprintf(clause, sizeof(clause), "you study %s", factsToUse[3]);
+              else if (cat == 5) snprintf(clause, sizeof(clause), "you are %s years old", factsToUse[4]);
+              else if (cat == 6) snprintf(clause, sizeof(clause), "your favorite snack is %s", factsToUse[5]);
+              else snprintf(clause, sizeof(clause), "you take %s", factsToUse[6]);
+              int wrote = snprintf(forcedMemoryReply + used, sizeof(forcedMemoryReply) - used,
+                                   "%s%s", used ? "; " : "I remember: ", clause);
+              if (wrote < 0 || (size_t)wrote >= sizeof(forcedMemoryReply) - used) break;
+              used += (size_t)wrote;
+            }
+            if (used) {
+              size_t room = sizeof(forcedMemoryReply) - used;
+              if (room > 2) strncat(forcedMemoryReply, ".", room - 1);
+              strncpy(workspace, forcedMemoryReply, 511);
+              workspace[511] = '\0';
+              finalDisplayPtr = workspace;
+              forcedMemoryAnswer = true;
+              currentEmotion = NEUTRAL;
+              emotionSetTime = millis();
+              LOGW("MEM", "Corrected broad memory reply from matching stored facts");
+            }
+          }
+          uint8_t category = 0;
+          if (strstr(questionLower, "color") || strstr(questionLower, "colour")) category = 2;
+          else if (strstr(questionLower, "milkshake") || strstr(questionLower, "drink") ||
+                   strstr(questionLower, "flavor") || strstr(questionLower, "flavour")) category = 3;
+          else if (strstr(questionLower, "study") || strstr(questionLower, "student")) category = 4;
+          else if (strstr(questionLower, "my name") || strstr(questionLower, "who am i")) category = 1;
+          else if (strstr(questionLower, "snack") || strstr(questionLower, "treat")) category = 6;
+          bool askedToClarify = !forcedMemoryAnswer && (strstr(answerLower, "not sure") || strstr(answerLower, "don't know") ||
+                                strstr(answerLower, "do not know") || strstr(answerLower, "remind me") ||
+                                strstr(answerLower, "tell me") || strstr(answerLower, "could you share") ||
+                                strstr(answerLower, "don't think") || strstr(answerLower, "dont think") ||
+                                strstr(answerLower, "care to share") || strstr(answerLower, "go-to treat") ||
+                                strstr(answerLower, "go-to snack"));
+          pendingMemoryFollowup = (category && askedToClarify) ? category : 0;
         }
 
         // Log AI's reply to history so she remembers her own jokes/statements
@@ -1587,12 +1915,6 @@ void syncAI(const char* prompt, bool isPersonal, Mode returnMode, bool bypassCoo
             core_lastConcern[sizeof(core_lastConcern) - 1] = '\0';
             if (random(0, 2) == 0) core_badDayFlag = true; // 50% chance heavy msg triggers bad day
           }
-        }
-
-        if (selfReflectionFired) {
-          copySafeText(core_selfReflection, sizeof(core_selfReflection), aiMsg);
-          lastSelfReflection = millis();
-          pendingMemorySave = true;
         }
 
         // Set core_lastExchangeTone based on currentEmotion
@@ -1638,40 +1960,63 @@ void syncAI(const char* prompt, bool isPersonal, Mode returnMode, bool bypassCoo
         }
         } // end if (!intentHandled) — skip post-processing for intent responses
       } else {
-        JsonVariant errorVariant = (*docResp)["error"]["message"];
+        JsonVariant errorVariant = docResp["error"]["message"];
         if (!errorVariant.isNull()) {
           const char* errStr = errorVariant.as<const char*>();
-          snprintf(aiMsg, sizeof(aiMsg), "API Err: %s", errStr ? errStr : "unknown");
-          currentEmotion = ANGRY; sound_angry();
-        } else strcpy(aiMsg, "No text...");
+          LOGW("NET", "Model API error %d: %.120s", httpCode, errStr ? errStr : "unknown");
+          bool rateLimited = httpCode == 429 || (errStr && strstr(errStr, "Rate limit"));
+          bool answeredFromMemory = false;
+          char offlineMemoryValue[120] = {};
+          if (rateLimited && memoryQueryActive && memoryQueryCategory >= 0 &&
+              memoryV2GetCategoryValue(verifiedMemoryFact, memoryQueryCategory,
+                                       offlineMemoryValue, sizeof(offlineMemoryValue))) {
+            const char* label = "";
+            switch (memoryQueryCategory) {
+              case 1: label = "your name is "; break;
+              case 2: label = "your favorite color is "; break;
+              case 3: label = "you like "; break;
+              case 4: label = "you study "; break;
+              case 5: label = "you are "; break;
+              case 6: label = "your favorite snack is "; break;
+              case 7: label = "you take "; break;
+            }
+            snprintf(aiMsg, sizeof(aiMsg), "I remember: %s%s%s", label, offlineMemoryValue,
+                     memoryQueryCategory == 5 ? " years old." : ".");
+            LOGI("MEM", "Answered category=%d from device storage during model rate limit", memoryQueryCategory);
+            answeredFromMemory = true;
+          } else if (rateLimited)
+            copySafeText(aiMsg, sizeof(aiMsg), "My chat service needs a short breather. Let's try again in a couple of minutes.");
+          else
+            copySafeText(aiMsg, sizeof(aiMsg), "I hit a connection snag just now. Could you try again?");
+          currentEmotion = answeredFromMemory ? NEUTRAL : CONFUSED;
+          emotionSetTime = millis();
+        } else {
+          LOGW("NET","No content in response. Raw JSON:");
+          serializeJson(docResp, workspace, sizeof(workspace));
+          LOGW("NET","%s", workspace);
+          workspace[0] = '\0';
+          strcpy(aiMsg, "No text...");
+        }
       }
       }
     
-    if (strcmp(prompt, "independent_thought") == 0) gainXP(5); else gainXP(10);
+    gainXP(10);
       if (strstr(aiMsg, "LEVEL UP!") == NULL) {
         heavyOpCooldown();
       }
-    delete docResp;
     // Cooldown before saveSys that may follow
     heavyOpCooldown();
   } else {
-    LOGW("NET","HTTP POST failed");
-    snprintf(aiMsg, sizeof(aiMsg), "Error %d", httpCode);
+    LOGW("NET","HTTP POST failed: %d", httpCode);
+    copySafeText(aiMsg, sizeof(aiMsg), "I lost my connection for a moment. Could you try again?");
     wifiFailCount++; // Proxy for low voltage: repeated failures → throttle
-    currentEmotion = ANGRY; // Frustrated with network failure
+    currentEmotion = CONFUSED;
     emotionSetTime = millis();
     scrollOffset = 0;
-    sound_angry();
-    // Feature 7: Network failures contribute to a bad day
-    if (random(0, 3) == 0) core_badDayFlag = true; // 33% chance
   }
   http.end(); 
   client.flush(); // Ensure all internal buffers are cleared
   client.stop(); // FIX: Explicitly close the Secure Client to free up the network stack immediately
-  
-  if (httpCode > 0 && triggerSilenceMqtt) {
-    sendMessage(PHONE_CONTACT_ID, aiMsg);
-  }
   
   lastIdleCheck = millis(); // Reset the idle action scheduler timer
   currentMode = returnMode;

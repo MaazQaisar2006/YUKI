@@ -36,3 +36,15 @@ static inline const char* _logFileName(const char* f) {
 
 // Shortcut to print heap with a tag
 #define LOG_HEAP(tag) do { if (LOG_DEBUG <= LOG_LEVEL) { Serial.printf("[%lu][%s][heap=%u]\n", millis(), (tag), ESP.getFreeHeap()); } } while (0)
+
+// Safe buffer append — clamps to buffer size, prevents snprintf overflow
+#include <stdarg.h>
+static inline void safeAppend(char* buf, size_t bufSize, int* used, const char* fmt, ...) {
+  if (*used < 0 || (size_t)*used >= bufSize - 1) return;
+  va_list args;
+  va_start(args, fmt);
+  int n = vsnprintf(buf + *used, bufSize - *used, fmt, args);
+  va_end(args);
+  if (n > 0) *used += n;
+  if ((size_t)*used > bufSize) *used = (int)bufSize;
+}

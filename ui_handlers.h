@@ -59,6 +59,12 @@ extern int rpgChoiceIdx;
 int rpgStoryScrollOffset = 0;
 unsigned long rpgStoryLastScroll = 0;
 
+// --- MODEL SELECT GLOBALS ---
+extern ModelEntry fetchedModels[MAX_MODELS];
+extern int fetchedModelCount;
+extern bool modelsFetched;
+int modelSelectIdx = 0;
+
 // --- QUICK RESPONSE GLOBALS (Stored in Flash to save RAM) ---
 static const char qr0[] PROGMEM = "How are you?";
 static const char qr1[] PROGMEM = "Hello!";
@@ -165,6 +171,42 @@ inline void executeTerminalCommand(const char* rawInput) {
       pinger.stop();
     } else {
       strcat(workspace, "Request timed out.\nStatus: Offline");
+    }
+  }
+  else if (strcmp(cmd, "scan") == 0) {
+    char hdr[48];
+    snprintf(hdr, sizeof(hdr), "Probing %s...\n", phoneIP.toString().c_str());
+    strcat(workspace, hdr);
+    int ports[] = {80, 443, 8080, 8443, 53};
+    const char* portNames[] = {"HTTP", "HTTPS", "8080", "8443", "DNS"};
+    int openPort = -1;
+    for (int p = 0; p < 5; p++) {
+      WiFiClient probe;
+      probe.setTimeout(1500);
+      unsigned long start = millis();
+      if (probe.connect(phoneIP, ports[p])) {
+        if (strlen(workspace) < 900) {
+          char line[48];
+          snprintf(line, sizeof(line), "%s: OK %lums\n", portNames[p], millis() - start);
+          strcat(workspace, line);
+        }
+        if (openPort < 0) openPort = ports[p];
+        probe.stop();
+      } else {
+        if (strlen(workspace) < 900) {
+          char line[48];
+          snprintf(line, sizeof(line), "%s: closed\n", portNames[p]);
+          strcat(workspace, line);
+        }
+      }
+      yield();
+    }
+    if (openPort >= 0) {
+      strcat(workspace, "Phone ONLINE");
+      userIsHome = true;
+      lastPresencePulse = millis();
+    } else {
+      strcat(workspace, "Phone UNREACHABLE");
     }
   }
   else if (strcmp(cmd, "ls") == 0) {
@@ -512,11 +554,11 @@ void handleMenuMode() {
   static const char m8[] PROGMEM = "SEND MSG"; static const char m9[] PROGMEM = "TERMINAL";
   static const char m10[] PROGMEM = "SYSTEM INFO"; static const char m11[] PROGMEM = "VIEW EMOTIONS";
   static const char m12[] PROGMEM = "GAMES"; static const char m13[] PROGMEM = "MEMORY REBOOT";
-  static const char m14[] PROGMEM = "SCROLL SPEED"; static const char m15[] PROGMEM = "SHUTDOWN";
-  static const char m16[] PROGMEM = "EXIT";
-  static const char* const menuItems[] PROGMEM = {m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12, m13, m14, m15, m16};
+  static const char m14[] PROGMEM = "SCROLL SPEED"; static const char m15[] PROGMEM = "MODEL SELECT";
+  static const char m16[] PROGMEM = "SHUTDOWN"; static const char m17[] PROGMEM = "EXIT";
+  static const char* const menuItems[] PROGMEM = {m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12, m13, m14, m15, m16, m17};
 
-  int menuLen = 17;
+  int menuLen = 18;
   int startI = (menuIdx > 3) ? menuIdx - 3 : 0;
   char buffer[20];
   
@@ -533,6 +575,17 @@ void handleMenuMode() {
       if(sys.scrollSpeed == 0) display.print("SLOW");
       else if(sys.scrollSpeed == 1) display.print("NORM");
       else display.print("FAST");
+    }
+    if(idx == 15) {
+      display.print(": ");
+      // Show abbreviated model name (max 7 chars after ": ")
+      const char* mdl = sys.currentModel;
+      const char* slash = strrchr(mdl, '/');
+      mdl = slash ? slash + 1 : mdl;
+      char abbreviated[8];
+      strncpy(abbreviated, mdl, 7);
+      abbreviated[7] = '\0';
+      display.print(abbreviated);
     }
     display.println();
   }
@@ -569,7 +622,8 @@ void handleMenuMode() {
     else if(menuIdx == 12) { menuIdx = 0; currentMode = GAME_SELECT; }
     else if(menuIdx == 13) { menuIdx = 0; currentMode = MEMORY_REBOOT; }
     else if(menuIdx == 14) { sys.scrollSpeed = (sys.scrollSpeed + 1) % 3; }
-    else if(menuIdx == 15) { menuIdx = 0; currentMode = SHUTDOWN_CONFIRM; }
+    else if(menuIdx == 15) { menuIdx = 0; currentMode = MODEL_SELECT; }
+    else if(menuIdx == 16) { menuIdx = 0; currentMode = SHUTDOWN_CONFIRM; }
     else { currentMode = FACE; statusBarVisibleUntil = millis() + 3000; }
     saveSys(); sound_confirm();
     dnBtnHeld = false; // Safety flush
@@ -745,12 +799,12 @@ void handleTtsTestMenuMode() {
       } else if (menuIdx == 5) {
         ttsSetPolarity(ttsGetPolarity() ? 0 : 1); sys.voicePolarity = ttsGetPolarity(); sound_blip();
       } else if (menuIdx == 6) {
-        int v[] = {0, 4, 8, 16, 32}; int c = ttsGetDeadband();
-        int i = 0; while (v[i] != c) i++; ttsSetDeadband(v[(i + 1) % 5]); sys.voiceDeadband = ttsGetDeadband(); sound_blip();
+        float v[] = {0, 0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4}; float c = ttsGetDeadband();
+        int i = 0; while (i < 9 && fabs(v[i] - c) > 0.01f) i++; ttsSetDeadband(v[(i + 1) % 9]); sys.voiceDeadband = ttsGetDeadband(); sound_blip();
       } else if (menuIdx == 7) {
         ttsSetSpread((ttsGetSpread() + 1) % 4); sys.voiceSpread = ttsGetSpread(); sound_blip();
       } else if (menuIdx == 8) {
-        int v[] = {50, 75, 100, 125, 150, 200}; int c = ttsGetVolGain();
+        int v[] = {50, 75, 100, 150, 200, 255}; int c = ttsGetVolGain();
         int i = 0; while (v[i] != c) i++; ttsSetVolGain(v[(i + 1) % 6]); sys.voiceGain = ttsGetVolGain(); sound_blip();
       } else if (menuIdx == 9) {
         ttsSetMonitor(!ttsGetMonitor()); sound_blip();
@@ -780,12 +834,12 @@ void handleTtsTestMenuMode() {
       } else if (menuIdx == 5) {
         ttsSetPolarity(ttsGetPolarity() ? 0 : 1); sys.voicePolarity = ttsGetPolarity(); sound_blip();
       } else if (menuIdx == 6) {
-        int v[] = {0, 4, 8, 16, 32}; int c = ttsGetDeadband();
-        int i = 0; while (v[i] != c) i++; ttsSetDeadband(v[(i + 4) % 5]); sys.voiceDeadband = ttsGetDeadband(); sound_blip();
+        float v[] = {0, 0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4}; float c = ttsGetDeadband();
+        int i = 0; while (i < 9 && fabs(v[i] - c) > 0.01f) i++; ttsSetDeadband(v[(i + 8) % 9]); sys.voiceDeadband = ttsGetDeadband(); sound_blip();
       } else if (menuIdx == 7) {
         ttsSetSpread((ttsGetSpread() + 3) % 4); sys.voiceSpread = ttsGetSpread(); sound_blip();
       } else if (menuIdx == 8) {
-        int v[] = {50, 75, 100, 125, 150, 200}; int c = ttsGetVolGain();
+        int v[] = {50, 75, 100, 150, 200, 255}; int c = ttsGetVolGain();
         int i = 0; while (v[i] != c) i++; ttsSetVolGain(v[(i + 5) % 6]); sys.voiceGain = ttsGetVolGain(); sound_blip();
       } else if (menuIdx == 9) {
         ttsSetMonitor(!ttsGetMonitor()); sound_blip();
@@ -945,7 +999,6 @@ void handleWifiConfigMode() {
       if (confirmed) {
         display.clearDisplay(); display.setCursor(0, 10); display.println("Clearing WiFi..."); display.display();
         sys.ssid[0] = '\0'; sys.pass[0] = '\0'; saveSys();
-        nvs_flash_erase(); nvs_flash_init();
         delay(500); ESP.restart();
       }
     } else {
@@ -1126,6 +1179,140 @@ void handleMqttConfigMode() {
       lastButtonPress = millis(); lastActivity = millis(); lastInteraction = millis(); lastIdleCheck = millis();
       showTopics = false; sound_blip();
     }
+  }
+}
+
+// --- MODEL SELECT: fetch free models from Groq, let user pick one ---
+// Declared here; defined in yuki_net.h
+extern int fetchGroqModels();
+
+void handleModelSelectMode() {
+  display.clearDisplay(); display.setCursor(0, 0); display.println("-- MODEL SELECT --");
+
+  // Step 1: Fetch models on first entry
+  if (!modelsFetched && WiFi.status() == WL_CONNECTED) {
+    display.setCursor(0, 20); display.println("Fetching models..."); display.display();
+    fetchedModelCount = fetchGroqModels();
+    modelsFetched = true;
+    modelSelectIdx = 0;
+    if (fetchedModelCount == 0) {
+      display.clearDisplay(); display.setCursor(0, 10); display.println("No models found."); display.setCursor(0, 25); display.println("Press BACK to exit."); display.display();
+      return;
+    }
+  }
+
+  if (fetchedModelCount == 0) {
+    if (WiFi.status() != WL_CONNECTED) {
+      display.setCursor(0, 15); display.println("Need WiFi connection.");
+    } else {
+      display.setCursor(0, 15); display.println("No models found.");
+    }
+    display.setCursor(0, 35); display.println("Press BACK to exit.");
+    display.display();
+    // Handle BACK
+    if (digitalRead(BTN_BACK) == LOW && millis() - lastButtonPress > debounceDelay) {
+      lastButtonPress = millis(); lastActivity = millis(); lastInteraction = millis(); lastIdleCheck = millis();
+      menuIdx = 0; currentMode = MENU; modelsFetched = false; sound_confirm();
+    }
+    return;
+  }
+
+  // Step 2: Show model list (max 4 visible, scrollable)
+  int startI = (modelSelectIdx > 1) ? modelSelectIdx - 1 : 0;
+  for (int i = 0; i < 4 && (startI + i) < fetchedModelCount; i++) {
+    int idx = startI + i;
+    display.setCursor(10, 15 + (i * 10));
+    display.print(modelSelectIdx == idx ? "> " : "  ");
+    // Show abbreviated model name (max 11 chars) + speed
+    const char* mdl = fetchedModels[idx].id;
+    const char* slash = strrchr(mdl, '/');
+    mdl = slash ? slash + 1 : mdl;
+    char abbreviated[12];
+    strncpy(abbreviated, mdl, 11);
+    abbreviated[11] = '\0';
+    display.print(abbreviated);
+    if (fetchedModels[idx].speed > 0) {
+      display.print(" ");
+      display.print(fetchedModels[idx].speed);
+      display.print("t");
+    }
+    // Mark current model with *
+    if (strcmp(fetchedModels[idx].id, sys.currentModel) == 0) {
+      display.print(" *");
+    }
+    display.println();
+  }
+
+  // Show current model at bottom
+  display.setCursor(0, 57); display.print("Active: ");
+  const char* curMdl = sys.currentModel;
+  const char* curSlash = strrchr(curMdl, '/');
+  curMdl = curSlash ? curSlash + 1 : curMdl;
+  char curAbbrev[10];
+  strncpy(curAbbrev, curMdl, 9);
+  curAbbrev[9] = '\0';
+  display.print(curAbbrev);
+  display.display();
+
+  // Step 3: Navigation
+  if (digitalRead(BTN_UP) == LOW && millis() - lastButtonPress > debounceDelay) {
+    lastButtonPress = millis(); lastActivity = millis(); lastInteraction = millis(); lastIdleCheck = millis();
+    modelSelectIdx = (modelSelectIdx + fetchedModelCount - 1) % fetchedModelCount;
+    sound_blip();
+  }
+  if (digitalRead(BTN_DN) == LOW && millis() - lastButtonPress > debounceDelay) {
+    lastButtonPress = millis(); lastActivity = millis(); lastInteraction = millis(); lastIdleCheck = millis();
+    modelSelectIdx = (modelSelectIdx + 1) % fetchedModelCount;
+    sound_blip();
+  }
+  if (digitalRead(BTN_SEL) == LOW && millis() - lastButtonPress > debounceDelay) {
+    lastButtonPress = millis(); lastActivity = millis(); lastInteraction = millis(); lastIdleCheck = millis();
+    // Test and apply the selected model
+    display.clearDisplay(); display.setCursor(0, 20); display.println("Testing model..."); display.display();
+    
+    WiFiClientSecure testClient; testClient.setCACert(NULL); testClient.setInsecure(); testClient.setTimeout(10000); testClient.setHandshakeTimeout(10);
+    HTTPClient testHttp;
+    testHttp.begin(testClient, "https://api.groq.com/openai/v1/chat/completions");
+    testHttp.setTimeout(15000);
+    testHttp.setConnectTimeout(5000);
+    testHttp.addHeader("Content-Type", "application/json");
+    
+    char authBuf[120];
+    snprintf(authBuf, sizeof(authBuf), "Bearer %s", API_KEY);
+    testHttp.addHeader("Authorization", authBuf);
+    
+    // Tiny test payload
+    char testPayload[200];
+    snprintf(testPayload, sizeof(testPayload),
+      "{\"model\":\"%s\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":5}",
+      fetchedModels[modelSelectIdx].id);
+    
+    int code = testHttp.POST((uint8_t*)testPayload, strlen(testPayload));
+    testHttp.end(); testClient.stop();
+    
+    if (code == 200) {
+      // Success — save as current model
+      strncpy(sys.currentModel, fetchedModels[modelSelectIdx].id, sizeof(sys.currentModel) - 1);
+      sys.currentModel[sizeof(sys.currentModel) - 1] = '\0';
+      fetchedModels[modelSelectIdx].works = true;
+      saveSys();
+      
+      display.clearDisplay(); display.setCursor(0, 20); display.println("Model activated!"); display.setCursor(0, 35);
+      display.println(fetchedModels[modelSelectIdx].id);
+      display.display(); sound_confirm();
+      delay(1500);
+      menuIdx = 0; currentMode = MENU; modelsFetched = false;
+    } else {
+      display.clearDisplay(); display.setCursor(0, 15); display.println("Model failed ("); display.print(code); display.println(")");
+      display.setCursor(0, 30); display.println("Try another model."); display.display();
+      fetchedModels[modelSelectIdx].works = false;
+      sound_error();
+      delay(1500);
+    }
+  }
+  if (digitalRead(BTN_BACK) == LOW && millis() - lastButtonPress > debounceDelay) {
+    lastButtonPress = millis(); lastActivity = millis(); lastInteraction = millis(); lastIdleCheck = millis();
+    menuIdx = 0; currentMode = MENU; modelsFetched = false; sound_confirm();
   }
 }
 
@@ -1996,7 +2183,7 @@ inline void handleGameRPSMode() {
     if (userChoice == aiChoice) {
         snprintf(aiMsg, sizeof(aiMsg), "Tie! Both picked %s.", choices[aiChoice]);
         currentEmotion = CONFUSED;
-        emotionVariantIndex[(int)CONFUSED] = random(0, 2);
+        emotionVariantIndex[(int)CONFUSED] = (emotionVariantIndex[(int)CONFUSED] + 1) % 2;
         emotionSetTime = millis();
         sound_confirm();
     } else if ((userChoice - aiChoice + 3) % 3 == 1) {
@@ -2004,14 +2191,14 @@ inline void handleGameRPSMode() {
         gainXP(15);
         Emotion winEmotions[] = {HAPPY, LAUGHING, WINK, TEASING};
         currentEmotion = winEmotions[random(0, 4)];
-        { uint8_t vc = 1; switch(currentEmotion) { case HAPPY: vc=3; break; case LAUGHING: vc=3; break; case WINK: vc=3; break; case TEASING: vc=5; break; default: vc=1; } emotionVariantIndex[(int)currentEmotion] = random(0, vc); }
+        { uint8_t vc = 1; switch(currentEmotion) { case HAPPY: vc=3; break; case LAUGHING: vc=3; break; case WINK: vc=3; break; case TEASING: vc=5; break; default: vc=1; } emotionVariantIndex[(int)currentEmotion] = (emotionVariantIndex[(int)currentEmotion] + 1) % vc; }
         emotionSetTime = millis();
         sound_level_up();
     } else {
         snprintf(aiMsg, sizeof(aiMsg), "I won! %s beats %s.", choices[aiChoice], choices[userChoice]);
         Emotion lossEmotions[] = {SAD, SASSY, CONFUSED, ANGRY};
         currentEmotion = lossEmotions[random(0, 4)];
-        { uint8_t vc = 1; switch(currentEmotion) { case SAD: vc=2; break; case SASSY: vc=2; break; case CONFUSED: vc=2; break; case ANGRY: vc=4; break; default: vc=1; } emotionVariantIndex[(int)currentEmotion] = random(0, vc); }
+        { uint8_t vc = 1; switch(currentEmotion) { case SAD: vc=2; break; case SASSY: vc=2; break; case CONFUSED: vc=2; break; case ANGRY: vc=4; break; default: vc=1; } emotionVariantIndex[(int)currentEmotion] = (emotionVariantIndex[(int)currentEmotion] + 1) % vc; }
         emotionSetTime = millis();
         sound_sad();
     }

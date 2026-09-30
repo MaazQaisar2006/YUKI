@@ -27,7 +27,7 @@
 // TTS runs in its own FreeRTOS task so the main loop (buttons, display, MQTT)
 // never blocks for the fetch+playback duration. 0 = real path.
 #define TTS_TASK_PRIO 1     // same as the Arduino loop task — interleaves, never starves
-#define TTS_TASK_STACK 4096 // verified via uxTaskGetStackHighWaterMark after first job
+#define TTS_TASK_STACK 6144 // increased from 4096 to prevent stack overflow on long sentences
 
 // C3 GPIO20 output registers (DR_REG_GPIO_BASE = 0x60004000): W1TS set / W1TC clear
 #define TTS_GPIO_OUT_W1TS (*(volatile uint32_t *)(0x60004000UL + 0x0008))
@@ -61,7 +61,7 @@ static inline void IRAM_ATTR ttsWriteDuty(int duty) {
 
 volatile bool ttsPlaying = false;
 char ttsPendingText[TTS_MAX_TEXT];
-bool ttsPendingSpeak = false;
+volatile bool ttsPendingSpeak = false;
 
 static volatile uint8_t ttsRing[TTS_RING_SIZE];
 static volatile uint16_t ttsHead = 0, ttsTail = 0;
@@ -85,7 +85,7 @@ static volatile bool ttsVoiceRefresh = false;  // menu entry -> worker refreshes
 // --- Test-bench knobs (RAM-only: menu writes, ISR reads once per tick) ---
 volatile uint32_t ttsKnobPulseUs = 55;   // 55/45/35/25 — max pulse width in µs
 volatile int     ttsKnobPolarity = 0;    // 0 NORM (active-low, idle HIGH) / 1 INV (active-high, idle LOW)
-volatile int     ttsKnobDeadband = 0;    // 0/4/8/16/32 — silence gate around sample 128
+volatile float   ttsKnobDeadband = 0;    // 0..4 float — silence gate around sample 128
 volatile int     ttsKnobSpread = 0;      // 0 lin / 1 boost 1.5x / 2 boost 2x / 3 clip
 volatile int     ttsKnobVolGain = 100;   // 50/75/100/125/150 — playback volume multiplier %
 volatile bool    ttsMonitor = false;     // live got/ticks heartbeat during playback
@@ -117,8 +117,8 @@ bool IRAM_ATTR ttsSampleTick(gptimer_handle_t timer, const gptimer_alarm_event_d
   }
 #endif
   int dv = (int)s - 128;
-  int db = ttsKnobDeadband;
-  if (db > 0 && dv >= -db && dv <= db) {   // silence gate: hold idle (SW) or 0% duty (LEDC)
+  float db = ttsKnobDeadband;
+  if (db > 0.0f && (float)abs(dv) < db) {   // silence gate: hold idle (SW) or 0% duty (LEDC)
 #if TTS_USE_SW_PWM
     if (ttsKnobPolarity == 0) TTS_GPIO_OUT_W1TS = TTS_SPK_MASK;
     else TTS_GPIO_OUT_W1TC = TTS_SPK_MASK;
@@ -195,7 +195,7 @@ static void ttsFetchVoiceList() {
   if (!sys.voiceOn || !sys.soundOn) return;   // muted: no backend traffic
   WiFiClient c;
   c.setTimeout(8000);
-  if (!c.connect(ttsRelayHost(), TTS_PORT)) { LOGW("TTS", "voices: connect failed"); return; }
+  if (!c.connect(ttsRelayHost(), TTS_PORT, 3000)) { LOGW("TTS", "voices: connect failed"); return; }
   c.printf("GET /voices/selectable HTTP/1.1\r\nHost: %s:%d\r\nConnection: close\r\n\r\n",
            ttsRelayHost(), TTS_PORT);
   char buf[768];
@@ -243,7 +243,7 @@ static bool ttsStreamPlay(const char* body, int bodyLen) {
   // Relay host: the phone's IP (set via MQTT, same IP presence pings) when
   // known, else the PC fallback.
   const char* host = ttsRelayHost();
-  if (!client.connect(host, TTS_PORT)) { LOGW("TTS", "connect %s:%d failed", host, TTS_PORT); return false; }
+  if (!client.connect(host, TTS_PORT, 3000)) { LOGW("TTS", "connect %s:%d failed", host, TTS_PORT); return false; }
   LOGI("TTS", "relay: %s:%d", host, TTS_PORT);
   client.printf("POST /tts HTTP/1.1\r\nHost: %s:%d\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n",
                 host, TTS_PORT, bodyLen);
@@ -252,9 +252,12 @@ static bool ttsStreamPlay(const char* body, int bodyLen) {
   // HTTP head, ONE byte at a time — a while(client.available()) drain here
   // over-reads into the body.
   String head;
+  if (!head.reserve(1024)) { LOGW("TTS", "not enough heap for response header"); client.stop(); return false; }
   unsigned long t0 = millis();
-  while (head.length() < 4 || head.substring(head.length() - 4) != "\r\n\r\n") {
-    if (millis() - t0 > 25000) { LOGW("TTS", "head timeout"); return false; }
+  while (head.length() < 4 || head[head.length() - 4] != '\r' || head[head.length() - 3] != '\n' ||
+         head[head.length() - 2] != '\r' || head[head.length() - 1] != '\n') {
+    if (millis() - t0 > 18000) { LOGW("TTS", "head timeout"); return false; }
+    if (head.length() >= 1024) { LOGW("TTS", "response header too large"); client.stop(); return false; }
     if (!client.available()) { delay(1); continue; }
     head += (char)client.read();
   }
@@ -278,7 +281,7 @@ static bool ttsStreamPlay(const char* body, int bodyLen) {
       if (n > 0) { hgot += (size_t)n; t0 = millis(); }
       else if (n < 0) break;
     } else if (!client.connected()) break;
-    else if (millis() - t0 > 15000) { LOGW("TTS", "header idle timeout"); return false; }
+    else if (millis() - t0 > 10000) { LOGW("TTS", "header idle timeout"); return false; }
   }
   if (hgot < sizeof(hdr) || memcmp(hdr, "RIFF", 4) != 0 || memcmp(hdr + 8, "WAVE", 4) != 0) {
     LOGW("TTS", "bad wav header: %d bytes", (int)hgot);
@@ -305,7 +308,7 @@ static bool ttsStreamPlay(const char* body, int bodyLen) {
 
   // --- Start playback: gptimer ISR 16kHz drives SPK_PIN (software PWM or LEDC) ---
   ttsSyncFromSys();   // load persisted voice config into the live knobs
-  ttsVol = (uint8_t)constrain(((uint32_t)sys.soundVolume * (uint32_t)ttsKnobVolGain) / 100, 0, 200);
+  ttsVol = (uint8_t)constrain(((uint32_t)sys.soundVolume * (uint32_t)ttsKnobVolGain) / 100, 0, 255);
   if (ttsVol == 0) return false;
 #if TTS_USE_SW_PWM
   // Voice drives the pin directly (software PWM) — plain GPIO, idle per polarity.
@@ -348,7 +351,12 @@ static bool ttsStreamPlay(const char* body, int bodyLen) {
     gcbs.on_alarm = ttsSampleTick;
     if (gptimer_register_event_callbacks(ttsTimer, &gcbs, NULL) != ESP_OK) {
       LOGW("TTS", "gptimer callbacks failed");
+      gptimer_del_timer(ttsTimer);
+      ttsTimer = NULL;
       ttsPlaying = false;
+#if !TTS_USE_SW_PWM
+      ledcDetach(SPK_PIN);
+#endif
       return false;
     }
     static gptimer_alarm_config_t galrm;
@@ -357,14 +365,38 @@ static bool ttsStreamPlay(const char* body, int bodyLen) {
     galrm.flags.auto_reload_on_alarm = true;
     if (gptimer_set_alarm_action(ttsTimer, &galrm) != ESP_OK) {
       LOGW("TTS", "gptimer alarm failed");
+      gptimer_del_timer(ttsTimer);
+      ttsTimer = NULL;
       ttsPlaying = false;
+#if !TTS_USE_SW_PWM
+      ledcDetach(SPK_PIN);
+#endif
       return false;
     }
-    gptimer_enable(ttsTimer);
+    if (gptimer_enable(ttsTimer) != ESP_OK) {
+      LOGW("TTS", "gptimer enable failed");
+      gptimer_del_timer(ttsTimer);
+      ttsTimer = NULL;
+      ttsPlaying = false;
+#if !TTS_USE_SW_PWM
+      ledcDetach(SPK_PIN);
+#endif
+      return false;
+    }
     LOGI("TTS", "gptimer ready (16kHz, prio 3)");
   }
-  gptimer_set_raw_count(ttsTimer, 0);
-  gptimer_start(ttsTimer);
+  if (gptimer_set_raw_count(ttsTimer, 0) != ESP_OK || gptimer_start(ttsTimer) != ESP_OK) {
+    LOGW("TTS", "gptimer start failed");
+    ttsPlaying = false;
+    gptimer_stop(ttsTimer);
+    gptimer_disable(ttsTimer);
+    gptimer_del_timer(ttsTimer);
+    ttsTimer = NULL;
+#if !TTS_USE_SW_PWM
+    ledcDetach(SPK_PIN);
+#endif
+    return false;
+  }
 
   LOGI("TTS", "params: pulse=%u pol=%d dead=%d spread=%d gain=%d mon=%d vol=%u",
        (unsigned)ttsKnobPulseUs, ttsKnobPolarity, ttsKnobDeadband, ttsKnobSpread,
@@ -445,7 +477,12 @@ ttsVol = (uint8_t)constrain(((uint32_t)sys.soundVolume * (uint32_t)ttsKnobVolGai
     delay(1);
   }
   ttsPlaying = false;
-  gptimer_stop(ttsTimer);   // restarted on next playback; no idle ISR preempting WiFi
+  if (gptimer_stop(ttsTimer) != ESP_OK) {
+    LOGW("TTS", "gptimer stop failed; releasing timer for clean reinitialization");
+    gptimer_disable(ttsTimer);
+    gptimer_del_timer(ttsTimer);
+    ttsTimer = NULL;
+  }
   // timer left stopped — the ISR is a no-op when !ttsPlaying, and restarting it
   // on later playbacks would need extra bookkeeping for no benefit
   ledcDetach(SPK_PIN);   // safe even if never attached (SW-mode fallback)
@@ -511,7 +548,7 @@ static void ttsWorker(void *arg) {
       body[bi++] = '}'; body[bi] = '\0';
 
       for (int attempt = 0; attempt < 3; attempt++) {
-        if (attempt > 0) delay(400);   // brief gap before the fresh retry connection
+        if (attempt > 0) delay(300);   // brief gap before the fresh retry connection
         if (ESP.getFreeHeap() < 40000) { LOGW("TTS", "low heap, skipping"); break; }
         if (ttsStreamPlay(body, bi)) break;
         LOGW("TTS", "stream attempt %d failed", attempt);
@@ -567,8 +604,8 @@ inline uint32_t ttsGetPulse()   { return ttsKnobPulseUs; }
 inline void     ttsSetPulse(uint32_t v)   { ttsKnobPulseUs = v; }
 inline int      ttsGetPolarity()          { return ttsKnobPolarity; }
 inline void     ttsSetPolarity(int v)     { ttsKnobPolarity = v; }
-inline int      ttsGetDeadband()          { return ttsKnobDeadband; }
-inline void     ttsSetDeadband(int v)     { ttsKnobDeadband = v; }
+inline float     ttsGetDeadband()          { return ttsKnobDeadband; }
+inline void     ttsSetDeadband(float v)   { ttsKnobDeadband = v; }
 inline int      ttsGetSpread()            { return ttsKnobSpread; }
 inline void     ttsSetSpread(int v)       { ttsKnobSpread = v; }
 inline int      ttsGetVolGain()           { return ttsKnobVolGain; }
