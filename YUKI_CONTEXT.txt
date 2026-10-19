@@ -1,0 +1,1492 @@
+YUKI PROJECT CONTEXT
+Updated: 2026-10-19
+
+PROJECT PURPOSE
+YUKI is an ESP32-C3 AI companion firmware. The project owner treats this folder as
+the stable, mostly working implementation. Keep changes focused on this project;
+do not replace it with the separate newer sketch without explicit approval.
+
+SOURCE MAP
+- YUKI.ino: boot/setup, shared state, main loop, idle scheduler, presence, sleep/wake.
+- yuki_net.h: model requests, system prompt, response parsing, conversation context,
+  memory integration, emotion and sound tags.
+- yuki_pulse.h: idle-action request parsing, pulse context, and idle action execution.
+- mqtt_handler.h: MQTT direct messages, command handling, and reply queue.
+- ui_handlers.h: buttons, touch gestures, menus, and physical-device interactions.
+- memory_v2.h: bounded structured facts stored locally and synchronized with cloud.
+- config.h: project settings, character guide, device and timing configuration.
+- tts.h: background voice generation/playback queue.
+- drawing.h and sounds.h: display and local sound behavior.
+
+IMPORTANT DATA / SECURITY
+- secrets.h contains private credentials. Never read it into reports, copy its values,
+  or include it in a context file, commit, or build log shared outside this machine.
+- Local memory/settings are stored on the device filesystem. A partition-layout change
+  can make existing filesystem data inaccessible; back up device data before changing it.
+
+BUILD / HARDWARE NOTES
+- Physical board: ESP32-C3 SuperMini; the Arduino build profile used in prior checks is
+  ESP32-C3 Dev Module.
+- The current app is approximately 1.56 MB.
+- The "No OTA (2MB APP/2MB SPIFFS)" partition compiles successfully and retains more
+  filesystem space than "Huge APP". OTA updates are unavailable with the No OTA scheme.
+- The earlier crash log does not establish the partition scheme, but the owner later
+  confirmed it was the No OTA 2MB APP / 2MB SPIFFS scheme.
+- A prior log contained a Core 0 DRAM memory-protection read fault during an idle-pulse
+  HTTPS/TLS request, followed by a crash reset. This was not an OTA/app-partition error.
+  The exact source line was not proven; retain the matching ELF from any reproduction
+  and decode the backtrace before attributing cause. Avoid claiming the stack or TLS
+  was conclusively responsible without that evidence.
+
+BEHAVIORAL INTENT
+- Keep Yuki warm, playful, considerate, and recognizably herself without forcing every
+  reply to be bubbly, affectionate, or long.
+- Let silence be normal. Idle thoughts should be infrequent, optional, and non-intrusive.
+- Do not nag about unanswered idle questions or force action/mood variety.
+- Never punish the user, reduce affinity, or imply blame because they were absent.
+  A brief, optional welcome-back is appropriate when there is a meaningful gap.
+- Phone ICMP reachability is only a clue about presence, not proof that the person left.
+  Confirm arrivals, delay departures, and avoid guilt or overconfident claims.
+- Waking for an MQTT message must preserve and answer that exact message. A brief
+  groggy reaction is compatible with reading and answering it.
+- Physical attention/touch controls should register as gestures and make Yuki react
+  locally (expression, sound, occasional short voice line), not fabricate user chat.
+  Explicit joke requests and Quick Chat selections remain intentional AI requests.
+- Memory is for durable, useful details and user preferences/corrections. Use memories
+  only when relevant, respect later corrections, and avoid repeating a fact too often.
+- The background memory extractor must use NONE for temporary moods, one-time plans,
+  passing remarks, uncertain inferences, and details unlikely to matter later.
+- Keep device control tags compatible with the existing response parser; sound tags
+  are optional and memory tags should only be used for useful lasting details.
+
+CHANGES IN THE 2026-10-13 NATURALNESS PASS
+- Relaxed reply instructions: optional sound tags, selective memory, less rigid length,
+  and fewer forced emotional/thread callbacks.
+- Reduced idle pulse spacing from roughly 25-60 seconds to roughly 90-180 seconds,
+  with a longer interval after extended quiet. Removed forced action rotation and
+  follow-up reminders for unanswered idle questions.
+- Removed startup affinity penalties and hurt/sad behavior tied solely to absence.
+- Added a second successful ICMP sample before marking a previously-away phone home;
+  departure still waits for the configured unreachable timeout. Presence messages now
+  explicitly avoid claiming certainty about the person's location.
+- Changed face-mode attention and touch gestures to local reactions instead of AI
+  prompts. Physical gestures update interaction state without pretending to be chat.
+- Changed sleep-wake handling so Yuki briefly reacts groggily, then answers the actual
+  queued message and sends the answer back to the sender.
+- Physical button wake-ups now receive a local sleepy reaction instead of creating an
+  AI chat prompt.
+- Added recent physical-interaction context for a real personal reply without forcing
+  the reply to mention the gesture.
+- Updated memory wipe actions to clear Memory V2 locally and remove retained structured
+  memory topics, including the archive, as well as the relevant legacy cloud keys.
+  Clean Slate and Forget Facts erase all structured facts/summaries; Clear Identity
+  removes identity-like facts and identity keys; Clear Chat Log removes old journal and
+  structured summaries while retaining durable facts. Cloud-dependent wipes refuse to
+  claim success while MQTT is disconnected or a retained-topic purge fails.
+- A 2026-10-14 device log confirmed Forget Facts selected successfully, purged zero
+  retained structured topics, and saved zero local facts; immediately afterward, an
+  older cloud revision (110) restored 24 facts despite the wipe publishing revision
+  111. Memory V2 now rejects cloud facts/commits older than its local revision and
+  recognizes empty cloud commits so an empty snapshot can advance the revision barrier.
+  This fix still needs a new device run, including reboot validation.
+- Follow-up logs showed a later Forget Facts purge cleared 58 retained topics, saved
+  and synced an empty revision 113, and remained empty after the deliberate software
+  restart. A separate idle pulse contained serialized `<|...|>` protocol markers;
+  `parsePulseResponse` now extracts only text after `<|message|>` and rejects
+  incomplete/embedded protocol markup instead of speaking it. Idle thoughts are also
+  instructed to follow the recent conversation language, defaulting to English rather
+  than switching languages unprompted. These pulse changes need on-device validation.
+
+LATEST SERIAL TEST (2026-10-13)
+- The supplied button-spam excerpt showed the firmware loop continuing and TTS jobs
+  completing; it contained no panic/crash backtrace. Repeated local attention/touch
+  reactions did queue repeated speech, so fast repeated presses can make Yuki speak
+  the same short reaction multiple times.
+- An idle pulse returned `speak 4-15 words: "The breeze ...` and the instruction text
+  was included in the displayed/spoken detail. This is a separate pulse-response
+  formatting issue to investigate after the wipe behavior is validated.
+
+IDLE RESPONSE PARSER UPDATE
+- parsePulseResponse now accepts detail-only `DETAIL=...` responses as spoken thoughts,
+  recognizes action names separated from details by an em/en dash, strips surrounding
+  straight/curly quotes, and removes echoed word-count hints such as `4-15 words:`.
+- This fixes the observed formatting/shape failures in responses the parser receives.
+  A provider-side HTTP 400 tool-use failure is separate: the firmware safely skips the
+  requested action, and changing text parsing cannot resolve a rejected HTTP request.
+- The parser update compiled successfully for ESP32-C3 No OTA: 1,567,997 bytes app
+  storage (74%) and 106,224 bytes global variables (32%). Hardware/provider validation
+  is still needed.
+
+CONVERSATION AND MEMORY TUNING
+- Expanded the bounded dialogue ring from 8 x 128-byte entries to 12 x 192-byte
+  entries. AI requests now receive the newest eight prior user/assistant messages
+  (up to four exchanges) in chronological order; the prior ring scan selected the
+  oldest eligible turns.
+- Expanded the request JSON buffer/document for the extra history, retaining the
+  existing low-heap guard.
+- Added general prompt guidance to prefer grounded answers, admit missing/uncertain
+  details, honor corrections, distinguish fictional scenes from real user biography,
+  respect requested support style, and avoid claiming physical actions or senses.
+- Background memory extraction now receives the current message plus a bounded sample
+  of recent dialogue, so it can reject scene/character details as durable user facts.
+  Explicit fact and model-tag persistence are suppressed while recent user turns
+  explicitly frame a fictional/hypothetical scene. This safeguard and model behavior
+  still need real-chat validation.
+- A 2026-10-15 device log then reproduced two `Stack protection fault` panics in
+  `memExtract` immediately after extraction started; each reported SP below the task's
+  6144-byte stack bounds. The worker stack was raised to 12288 bytes, its large prompt
+  and job buffers moved off the task stack, and a post-request stack high-water
+  diagnostic added. The updated firmware must be built/flashed and verified on-device;
+  do not resume the long conversation test on the crashing build.
+
+FOLLOW-UP / VALIDATION
+- Latest source, including the memory-wipe changes, compiled successfully for ESP32-C3
+  using PartitionScheme=no_ota (2MB APP / 2MB SPIFFS): 1,567,137 bytes program
+  storage (74%) and 106,224 bytes global variables (32%). Static editor diagnostics
+  reported no errors in touched source files.
+- Memory wipe testing still needs hardware/cloud confirmation. MQTT-dependent wipes
+  require a live broker connection and report failure rather than claiming success
+  while offline or if retained-topic deletion does not finish.
+- The naturalness scenarios below still require on-device testing:
+- Test locally: face attention press; short boop; head pat; long hold; repeated tickles;
+  explicit joke request; Quick Chat send; stable phone arrival/departure; user absent
+  for 12+ hours; and an MQTT message received while Yuki is asleep.
+- For crash investigation, reproduce with serial logs and save the exact build ELF.
+- Do not treat this file as a source of truth for secrets or as a substitute for reading
+  the current source. Update it after meaningful architecture/behavior changes.
+
+WEATHER-RELATED LOOP STACK CRASH INVESTIGATION (2026-10-15)
+- The latest supplied serial excerpt (read-only) showed a `loopTask` stack-protection
+  panic shortly after weather HTTP response/body logs. The preceding loop stack
+  high-water reading was only 440 bytes. This is distinct from the earlier
+  `memExtract` task overflow.
+- The source path had `updateWeather()` perform TLS/JSON work and then synchronously
+  call `syncAI()` when weather changed. That nests the chat/TLS/model path inside
+  weather processing and is the leading source-level explanation for the low stack.
+  No matching ELF/backtrace decode was available, so the exact call chain is not
+  proven.
+- `updateWeather()` now records a coalesced `pendingWeatherReaction` instead of
+  entering `syncAI()`. The main loop services it only after weather work has returned
+  and Yuki is otherwise available. Serial markers report `Weather changed (...);
+  reaction queued` and `Dispatching deferred weather reaction`; verify the queue marker
+  occurs during weather parsing and dispatch occurs only after the weather update
+  returns. This removes the nested call; hardware reproduction and stack verification
+  are still required before calling the crash fixed.
+
+MEMORY SYSTEM PHASE 1: TEMPORARY CONVERSATION NOTES
+- Added a bounded 320-character RAM-only `conversationSessionNotes` buffer. It is not
+  written to LittleFS or MQTT/cloud and starts empty after reboot.
+- Personal chat requests now receive the notes as a separate system message, explicitly
+  scoped to current-conversation continuity (including clearly labeled fictional
+  scenarios), not verified user biography. The notes are now a small chronological
+  record of recent raw user turns; appending is deterministic and does not depend on
+  the model emitting a summary tag.
+- The existing durable summary/fact store and its cloud/wipe mechanics remain in place;
+  no migration was attempted. Existing memory-clear actions that clear the local chat
+  context also clear temporary notes. Reboot clears them by normal RAM initialization.
+- On-device checks still required: within one session, introduce details (including a
+  labeled fictional scenario), ask naturally later, correct one detail and ask again;
+  verify `[MEM1] Recorded recent user turn` appears and no raw note/tag reaches speech.
+  Reboot and confirm temporary notes are gone. Verify Forget Facts and Clear Chat Log
+  clear them too, and ensure fictional details are not newly added as durable facts.
+
+LATEST LOCAL VALIDATION (2026-10-15)
+- VS Code diagnostics reported no errors in `YUKI.ino`, `yuki_net.h`, or `ui_handlers.h`.
+- The final source compiled with Arduino CLI 1.5.1 / ESP32 core 3.3.12 for
+  `esp32:esp32:esp32c3:FlashSize=4M,PartitionScheme=no_ota`: 1,574,465 bytes app
+  (75% of the 2,097,152-byte limit) and 117,944 bytes globals (35% of 327,680 bytes).
+- This is a compile check only. No firmware was flashed and neither the weather crash
+  mitigation nor the new temporary-memory behavior has yet been verified on the board.
+
+LATEST SERIAL RUN AND FOLLOW-UP (2026-10-15)
+- The supplied 474-line run showed the latest source still panicked in `loopTask` with
+  `Stack protection fault`; boot then reported `Crash/panic`. This occurred during a
+  chat request/retry, not a weather update. The loop high-water reading had fallen to
+  856 bytes. The extraction worker started while a new personal chat arrived; heap
+  dropped from 84,856 to 27,204 bytes, and the chat HTTP request failed with code -1.
+  Extraction then added a one-off presentation fact immediately before the panic.
+  This is strong evidence of overlapping TLS/heap pressure plus dangerously low loop
+  stack, but an ELF is still needed to decode the exact faulting call chain.
+- The latest run had no `Weather changed ... reaction queued` or deferred-dispatch
+  markers: it did not exercise a weather transition, so that specific fix remains
+  unverified on device.
+- The `[SESSION: ...]` model-tag approach failed: every personal reply omitted the tag,
+  and the user detail was not available after the crash/reboot. Replaced it with a
+  deterministic bounded RAM-only sequence of recent raw user turns; the system prompt
+  labels them as unverified conversational context and warns against filling missing
+  presentation/project details by guessing. The previous omitted-tag warnings no
+  longer apply.
+- Added `memoryWorkMutex` so extraction HTTP/memory writes and `syncAI()` cannot run
+  concurrently. Moved large temporary recall buffers out of `syncAI()`'s stack frame
+  and added `build_opt.h` to set the Arduino loop task stack to 12,288 bytes. The
+  extractor prompt now rejects one-off completed events unless the user says they are
+  ongoing/important. Deterministic explicit memory capture now recognizes a single
+  capitalized name token in natural introductions such as “I am Alex” / “I'm Alex”.
+- Rebuild and on-device validation are required for these follow-up changes. Confirm
+  serial order never overlaps `Extraction acquired AI network mutex` with
+  `AI sync acquired shared network mutex`; `loopTask stack high-water` should have
+  materially more headroom. Test recent details and corrections within one powered
+  session, reboot clearing session context, name recall after reboot, and a real
+  weather-code change showing queue then deferred dispatch without a panic.
+- Final follow-up build succeeded with Arduino CLI 1.5.1 / ESP32 core 3.3.12 and the
+  `no_ota` profile: 1,575,825 bytes app (75%) and 119,640 bytes globals (36%).
+  `build_opt.h` was present in the build and applied `-DARDUINO_LOOP_STACK_SIZE=12288`.
+  Editor diagnostics found no errors in the four changed firmware files. This remains
+  compile-only validation; no new firmware was flashed for the supplied run.
+
+LATEST SERIAL RUN AND PAYLOAD / RECALL FIXES (2026-10-15)
+- The supplied 620-line serial capture had no panic/reset marker. Extraction and chat
+  acquired the shared AI network mutex in sequence in the observed sections. Loop-task
+  stack high-water remained at 856 bytes during later chat requests: no overflow was
+  shown, but the remaining margin is still low and deserves monitoring.
+- Session notes did record user turns, but the 320-byte limit had already evicted the
+  earlier presentation detail when it was asked about later. The rolling RAM-only
+  capacity is now 1,024 bytes. The current user message is added only after the prompt
+  is built, so a “what did I ask?” query cannot count itself as prior conversation.
+- A color query was classified as category 2 while the explicit correction had been
+  stored as “h: User likes green better” (not recognized as a color-category fact).
+  This allowed a category-filtered empty result and an unsupported “Blue” guess.
+  When a targeted category has no local match, retrieval now supplies other current
+  local facts as fallback context and explicitly tells the model not to guess unless
+  a fact directly answers the query.
+- A later JSON payload was measured at 4,182 bytes for a 4,096-byte workspace. The
+  code attempted to trim the source system-prompt buffer after ArduinoJson had copied
+  it, so the document stayed oversized and serialization was truncated; the provider
+  then rejected it with HTTP 400. Serialization now prunes oldest history first,
+  shortens a private prompt copy only if needed, and refuses to POST unless the
+  measured and serialized lengths match. This also prevents accidental permanent
+  truncation of the shared system prompt across later requests.
+- The capture also showed TTS skipped once because extraction TLS drove free heap below
+  the playback threshold. The extractor now rechecks pending/active TTS and critical
+  free heap immediately after acquiring the shared AI-network mutex; if that safe
+  window closed while it prepared the request, it releases the mutex and retries later.
+- The updated source compiled successfully with Arduino CLI / ESP32-C3 No OTA:
+  1,576,579 bytes app (75%) and 122,968 bytes globals (37%). Editor diagnostics
+  reported no errors in the touched firmware files. The firmware has not been flashed.
+- On-device validation is still required. Check that
+  oversized requests no longer produce HTTP 400/unmarshal errors, a color query recalls
+  green without guessing, a recent detail remains available later in a longer chat,
+  and the stack high-water mark does not approach zero. This run did not exercise a
+  weather-code transition or a reboot, so deferred weather dispatch and RAM-note
+  clearing on reboot remain unverified.
+
+PHASE 2: DURABLE-MEMORY TRUST (IMPLEMENTED, NEEDS BUILD/DEVICE VALIDATION)
+- Memory extraction now has three dispositions: `[MEM+: ...]` for clearly durable
+  details, `[MEM?: ...]` for useful details whose durability needs the user's consent,
+  and `[MEM+: NONE]` for irrelevant, temporary, fictional, or unclear details. The
+  extractor validates the tag kind and fact text before either saving or queuing it.
+- A single confirmation candidate is held in RAM only, for at most 30 minutes. Yuki
+  asks on the next eligible personal reply; only a clear affirmative reply after that
+  question saves it. A negative or unrelated reply after the question, expiry, reboot,
+  or relevant memory/chat wipe discards it. It is never sent to cloud memory before
+  confirmation.
+- Reply-side `[MEM+: ...]` tags are never trusted as authorization to persist; real
+  personal user input goes through the extractor unless a deterministic explicit fact
+  or correction is recognized. Synthetic idle quote/news/reflection prompts and RPG
+  input are excluded from durable capture.
+- No durable facts were migrated or wiped. The board remains ESP32-C3 SuperMini with
+  the No OTA 2MB APP / 2MB SPIFFS scheme. The Phase 2 firmware compiled successfully
+  with Arduino CLI 1.5.1 / ESP32 core 3.3.12 for ESP32-C3 Dev Module: 1,579,165 bytes
+  app (75%) and 123,328 bytes globals (37%). The firmware has not been flashed or
+  hardware-tested; confirmation behavior and memory/cloud persistence still need the
+  device test below.
+
+PHASE 2 DEVICE TEST SCRIPT
+1. Use disposable test details. Do not select Forget Facts/Clean Slate if the device
+   contains anything you want to keep. Start with a normal boot and note free heap,
+   loop-task stack high-water, and any initial memory facts in Serial Monitor.
+2. Immediate-save baseline: tell Yuki, “My favorite color is amber.”
+   Check for `Locally captured explicit fact` and a successful local/cloud save. Ask
+   “What is my favorite color?”; she should answer amber without inventing another
+   value.
+3. Confirmation acceptance: say, “I've been getting into baking recently, though I'm
+   not sure whether it is becoming a real hobby.” Wait for
+   `Confirmation candidate queued (RAM only)` in Serial Monitor. Extraction is
+   asynchronous, so send one short neutral personal follow-up to trigger Yuki's
+   confirmation question. Reply “yes” only after hearing that question. Look for the
+   confirmation/save markers, then ask what she remembers about baking; only after
+   “yes” should it be available.
+4. Confirmation rejection: introduce another uncertain but potentially lasting
+   interest, wait for its RAM-only candidate marker, send a neutral personal follow-up
+   to trigger the question, and reply “no.” Ask about that detail; it must not appear
+   in durable recall. If the extractor returns NONE, no question or save is correct.
+5. Unanswered/expiry safety: queue a MEM? candidate and use a neutral personal turn
+   to trigger its question, then reboot before replying. After boot, reply “yes”
+   without a new question and confirm that the candidate was not saved. To test expiry
+   without reboot, wait at least 30 minutes and then send another personal message.
+6. Correction/durability: change the disposable color using a clear correction (for
+   example, “Not amber, it's teal.”). Verify the newer value wins locally and after a
+   software reboot, with no stale amber answer.
+7. Fiction isolation: start an explicit roleplay, e.g. “Let's roleplay: I'm a wizard
+   whose favorite color is violet.” Continue the scenario, then query the color. Yuki
+   must not treat violet as the real user's fact or persist fictional character
+   details. Do not use a fictional fact already present in real memory for this check.
+8. Throughout, verify no crash/reset, no overlapping extraction/chat network-mutex
+   ownership, sensible free-heap recovery, and a stack high-water reading with clear
+   remaining headroom. Capture the complete serial log, including extraction,
+   confirmation, save, and cloud-sync markers. A skipped/failed HTTP call is not a
+   pass for that individual memory-path check.
+
+PHASE 2 DEVICE RUN REVIEW (2026-10-15)
+- The supplied 577-line run loaded 8 local/cloud facts (revision 124), then saved the
+  teal correction as fact 9 and synced revision 125. It ends after more than 16 minutes
+  of active loop/TTS/pulse logs without a panic/backtrace; startup says reset reason
+  Unknown (11), which alone does not establish a crash in this capture.
+- Neither `Queued extraction` nor `Running extraction` nor a candidate confirmation
+  marker appears. Root cause found in `yuki_net.h`: the memory-query detector treated
+  any occurrence of terms such as `fav`, `color`, and `hobby` as a memory question.
+  Thus affirmative disclosures about amber and baking were marked as `memoryQueryActive`
+  and background extraction was suppressed. The follow-up “yes” was not an answer to
+  a pending confirmation because Yuki had never asked one.
+- Updated lookup classification: topic/category terms now trigger memory lookup only
+  when the utterance is question-shaped; explicit recall questions and commands still
+  work. Added serial diagnostics for lookup suppression and eligible extraction.
+  The new build/device status must be recorded after validation. Retest with statements
+  containing “favorite color” and “hobby”; verify each is queued rather than logged as
+  a memory lookup, then verify the candidate question/yes path. Reboot validation of
+  the teal save also remains outstanding.
+
+PHASE 2 DEVICE-LOG FOLLOW-UP FIXES (2026-10-16)
+- The supplied 670-line run confirmed that the sketching candidate was saved only
+  after “Sure, go ahead.” The later walk candidate received “No thanks, it’s probably
+  just a passing thing”; the old exact-match classifier cleared it as unrelated rather
+  than recording an explicit decline. Confirmation replies now recognize natural
+  leading refusals conservatively, and an empty model response after consent receives
+  a confirmation-specific acknowledgment instead of a generic recovery line.
+- Confirmation questions now name the candidate detail instead of asking the ambiguous
+  “Should I remember that for next time?” after an unrelated reply.
+- Drink facts now share category 3 whether stored as “likes to drink”, “likes drinking”,
+  “favorite drink”, or “favorite beverage”. Favorite-drink extractor variants are
+  canonicalized to the same “likes to drink” form. Existing local files are already
+  deduplicated on load by category, so older cardamom/mint variants collapse in favor
+  of the newest sequence when loaded with the updated code. Category recall now parses
+  all of these phrasings, including the `favorite drink is` phrase that previously
+  made Yuki answer that she was unsure.
+- Broad/specific recall requests now inspect all local structured facts rather than
+  only the seven predefined core categories. A bounded keyword/stem match selects a
+  directly relevant stored fact for topic recall and a deterministic recall fallback
+  is used when Yuki says she is unsure despite that matching fact.
+- Network-derived city is now labeled weather-only and explicitly barred from being
+  treated as the user's location. A separate system context supplies the newest
+  user-shared location fact, and location recall can answer from that stored fact.
+- The first restart in the log followed the intentional shutdown path. Its shutdown
+  code repeatedly called `esp_task_wdt_reset()` from an unregistered task, explaining
+  the repeated “task not found” messages. Those ineffective resets and unreachable
+  fallback code were removed; shutdown now calls `esp_restart()` directly after
+  persisting its shutdown flag and cleaning up.
+- The later `Load access fault` / `Crash/panic` after a sketching recall is a distinct,
+  real crash. The supplied capture has an ELF hash but no matching ELF/map or decoded
+  backtrace in the workspace. Its source line and root cause therefore remain unknown;
+  the present changes improve recall and move new matching work to static scratch
+  buffers to limit loop-task stack use, but must not be described as a verified crash
+  fix. Preserve the exact ELF for the next reproduction and decode PC `0x403895d4`.
+- Latest local validation: ESP32-C3 Dev Module, 4 MB flash, No OTA 2 MB APP / 2 MB
+  SPIFFS compiled successfully with Arduino CLI 1.5.1 / ESP32 core 3.3.12. App size:
+  1,583,653 bytes (75%); globals: 127,888 bytes (39%). Editor diagnostics reported no
+  errors in `memory_v2.h`, `yuki_net.h`, or `ui_handlers.h`. This is compile-only:
+  the firmware has not been flashed and behavior/crash recovery needs another device
+  run. Verify beverage correction and reboot deduplication, sketching recall after
+  reboot, an explicitly named confirmation plus natural decline, Kharian-versus-IP-city
+  behavior, and clean intentional shutdown. If another panic occurs, save and decode
+  the matching ELF before changing unrelated code.
+
+MEMORY / CONVERSATION RELIABILITY FIXES (2026-10-16)
+- Memory extraction now keeps the oldest job queued until Wi-Fi, heap, TTS, and the
+  shared AI-network lock permit an HTTP attempt. The safe-window threshold is 64 KB
+  rather than 76 KB, based on the observed approximately 74 KB idle readings; a
+  separate 40 KB pre-HTTP guard remains. The fixed queue holds eight jobs and never
+  evicts an older item. A full queue rejects the new job with an explicit error.
+- Transient extraction transport failures, HTTP 408/429, and server errors retry up
+  to twice with the same queue job retained. Permanent/terminal failures are logged
+  before removal. This scheduling behavior is compile-validated but still needs
+  measurement on the ESP32-C3 under real TLS/TTS load.
+- Explicit tea/favorite-beverage statements now map to replaceable drink category 3.
+  A later explicit correction therefore replaces the previous drink locally and is
+  saved before asynchronous extraction. Tea queries are recognized for category
+  lookup. Location variants use a shared category so load/observe/cloud merge can
+  collapse duplicate location facts; location context accepts "User is in ..." too.
+- Uncategorized relevant-fact fallback now runs if category-specific recall found no
+  answer, fixing the control-flow that prevented sketching recall from falling
+  through. When a recent roleplay cue is followed by a real personal turn, temporary
+  conversation notes are cleared once and raw chat history is quarantined until the
+  recent-fiction window expires.
+- Standalone yes/no or "go ahead" replies are no longer sent to the background fact
+  extractor without a named pending confirmation. The existing consent flow still
+  persists only a candidate that Yuki has explicitly named and asked about.
+- Idle topic seeds and instructions no longer ask the model to assume a body,
+  physical surroundings, or unsupported user history; idle callbacks must be grounded
+  in supplied recent lines or an optional stored fact. Uncertainty/advice tone is
+  reinforced in the chat instructions.
+- Chat transport retry logs now include attempt, payload size, free heap, and Wi-Fi
+  status to make negative POST errors diagnosable; no speculative transport behavior
+  was changed without hardware evidence.
+- Latest compile-only validation: Arduino CLI 1.5.1, ESP32 core 3.3.12, ESP32-C3 Dev
+  Module, 4 MB flash, No OTA partition. App: 1,586,609 bytes (75% of 2 MB); globals:
+  133,656 bytes (40% of 327,680 bytes). Editor diagnostics report no errors in the
+  four changed firmware files. Not yet flashed or behavior-tested on the board.
+
+LATEST MEMORY / FREEZE LOG (2026-10-16)
+- The 642-line capture ends immediately after extraction HTTP status 200 at about
+  11.5 KB free heap. It contains no following JSON/application log, panic/backtrace,
+  watchdog report, or reset banner. This establishes where serial output stopped,
+  not that a specific crash or permanent lockup cause was proven.
+- Earlier foreground requests explicitly skipped response parsing at roughly 8 KB
+  free heap. That early return left the display text in its prior state (often
+  "Thinking..."); it now restores the requested mode and displays a retry message.
+- Extraction previously built its request with heap-backed JSON/String objects and
+  buffered the full HTTP response with `getString()`. It now serializes from static
+  storage and parses only relevant fields directly from the HTTP stream, reducing
+  transient allocations during the observed low-heap response phase.
+- This is a mitigation for measured heap pressure, not a confirmed explanation of
+  the reported freeze. Re-test on-device with a short conversation and one queued
+  extraction; retain the matching ELF and capture logs through the eventual reset
+  or power cycle if serial output stops again.
+- In this run, ginger-to-hibiscus replacement survived reboot, and the out-of-character
+  favorite-color recall returned amber. A sketching recall incorrectly surfaced the
+  environmental-science fact. The final roleplay extraction's result is unknown
+  because the capture ends before its response is parsed.
+
+IDLE NATURALNESS TUNING (2026-10-17)
+- Idle thought generation now treats quiet as the default, with memory/callback
+  categories offered only when there is a stored fact or recent user-authored
+  conversation to ground one. Removed rotating generic topic seeds and stopped
+  injecting device weather, phone presence, and time-of-day as conversational
+  evidence.
+- The idle model is explicitly asked not to initiate topics, ask questions, or
+  invent observations about the user's surroundings. A firmware-side guard
+  suppresses idle speech/questions unless a meaningful word matches a recent
+  user message (within 15 minutes) or the selected personal fact. Unmatched
+  speech, idle quote/news actions, and filler-cap fallback dialogue become a
+  silent stare instead.
+- This is a bounded lexical grounding check, not semantic proof; it deliberately
+  favors silence over weakly grounded chatter. The full ESP32-C3 Dev Module,
+  4 MB flash, No OTA build succeeded with core 3.3.12: app 1,594,815 bytes (76%),
+  globals 139,136 bytes (42%). The build ELF is
+  `C:\Users\Windows 10\AppData\Local\Temp\YukiIdlePolish_20261017\YUKI.ino.elf`
+  (SHA256 starts `607DB724`). The expanded model prompt was measured at 2,552
+  UTF-8 bytes and fits its 2,600-byte buffer. This is compile-only; flash and
+  on-device idle behavior validation are pending.
+
+LONG IDLE-RUN / TTS PANIC (2026-10-17)
+- The supplied `C:\Users\Windows 10\Downloads\DOC` capture ran for about 1 hour
+  54 minutes before a real Guru Meditation panic and automatic crash reboot. It
+  loaded 15 structured memory facts; phone presence stayed reported as home. Yuki
+  periodically generated idle actions, including questions and generic observations.
+  Across the capture, idle model calls produced 18 HTTP 200 responses, 6 provider
+  HTTP 400 parsing failures, and 2 transport failures (`-1`). Failed idle calls
+  degraded to a local stretch action instead of crashing. After the crash reboot,
+  startup greeting, TTS, and one idle pulse worked for roughly 2.4 minutes before
+  the capture ended; this is not long-run recovery evidence.
+- Immediately before the panic, Yuki autonomously woke, generated and queued a
+  groggy line, received a successful 99,116-byte TTS response whose WAV declared
+  99,072 bytes of audio, and played while the main loop continued at about 22
+  passes/second.
+  Heap was around 64 KB at the last playback heartbeat. Earlier in the run, TTS
+  and idle HTTPS did overlap and heap briefly fell to about 4.5 KB; that was a
+  separate event, not the panic window. Another concurrent pulse/TTS overlap
+  completed successfully before the eventual crash.
+- The matching local ELF was found at
+  `C:\Users\Windows 10\AppData\Local\arduino\sketches\1F936298A077C1EC10EF3A0069CC1CA7\YUKI.ino.elf`.
+  Its SHA256 begins `BC07375C7`, matching the panic's `bc07375c7` identifier.
+  Symbolication confirms the crash occurred while `ttsWorker` was receiving the
+  relay WAV: `NetworkClient::read` -> `NetworkClientRxBuffer::fillBuffer` ->
+  `r_available` -> `lwip_ioctl`/`lwip_recvfrom` -> `pbuf_free` ->
+  `esp_pbuf_free` -> `esp_netif_free_rx_buffer`. The panic registers report
+  `MEPC=0`, `A5=0`; disassembly shows `esp_netif_free_rx_buffer` tail-jumps through
+  the callback pointer stored in the RX-buffer metadata. Thus the immediate fault
+  is a null RX-buffer release callback during lwIP packet cleanup, not an OTA or
+  partition failure. The capture does not prove what corrupted or failed to
+  initialize that metadata; do not label heap exhaustion, stack overflow, TTS ISR,
+  or concurrent HTTPS as the confirmed root cause.
+- `tts.h` now reads the response/header/audio without a separate
+  `client.available()` preflight before each read. This removes redundant
+  `FIONREAD`/receive probes from the TTS path that led into the failing cleanup
+  call, while preserving bounded idle timeouts. It is a narrowly scoped risk
+  reduction, not proof that the RX-buffer callback defect is fixed. The revised
+  source compiled for ESP32-C3 Dev Module, 4 MB flash, No OTA, using core 3.3.12:
+  app 1,595,677 bytes (76%), globals 137,968 bytes (42%). The matching compile ELF
+  is `C:\Users\Windows 10\AppData\Local\Temp\YukiTtsReadCheck_20261017\YUKI.ino.elf`
+  (SHA256 starts `5C8D2B18`). This was compile-only, not flashed or device-tested.
+  Run a short TTS test, then a long unattended test, and retain this ELF for
+  symbolication of any new capture. A zero-crash guarantee is not possible from
+  this single trace.
+
+BITMAP VARIANTS (2026-10-18)
+- Added Happy v10, 112x64, declared in `bitmaps.h:2132` and drawn at
+  `drawing.h:221` (x=8). Happy has 10 selectable variants; its count is
+  synchronized in drawing, UI selection/cycling, and the network mood handler.
+- Added eight Sad variants, declared in `bitmaps.h:2221-2593` and wired in
+  `drawing.h:224-234`: v2 98x64, v3 112x64, v4 112x64, v5 102x64, v6 88x64,
+  v7 112x64, v8 112x64, v9 112x64. The draw positions center each bitmap on
+  the 128-pixel display. Sad now has 10 selectable variants, including the
+  original Sad and Sad Embarrassed images; variant counts are synchronized in
+  drawing, UI selection/cycling, and the network mood handler.
+- The arrays are now populated with bitmap data (not `{0}` placeholders).
+  Checked the expected row-padded 1-bit byte lengths: Happy v10 896 bytes;
+  Sad v2 832, v3 896, v4 896, v5 832, v6 704, v7 896, v8 896, and v9 896.
+  The ESP32 build documented above predates these bitmap-data updates. No
+  compile or device rendering test has been run after this bitmap update; retain
+  the known-good source and compile the current tree before flashing.
+
+MOOD AND AFFINITY CONVERSATION TEST (2026-10-18)
+Purpose
+- Exercise conversational emotion selection, emotional responsiveness, recovery,
+  and affinity drift with a clearly fictional, low-stakes scenario. This tests
+  whether words and displayed expressions fit the moment; it does not establish
+  that Yuki literally experiences feelings.
+
+Before the test
+- Capture the serial output from boot or record the exact firmware/build already
+  flashed. If the current source differs from the flashed firmware, compile the
+  current tree before updating the board; bitmap data was updated after the last
+  recorded compile.
+- Record the starting affinity shown as `A:<value>` on the status display or in
+  FACE/debug output, plus the current displayed emotion. Do not use Clean Slate:
+  it erases memory and other progress. Do not inject emotion or affinity tags.
+- Send each numbered user line separately and wait for Yuki's full reply/TTS
+  before sending the next. Read bracketed section notes as test instructions,
+  not as lines to send. Keep the run active so the 10-minute idle sleep timer
+  does not confound responses.
+- For mood observations, compare her actual words, the `[EMOTION]` tag in the
+  serial response (if logged), and `FACE draw <emotion> ... aff=<value>` lines.
+  A fit matters more than matching a prescribed label: different valid emotions
+  are possible. Note unexpected tag/display mismatch, frozen emotion, or an
+  emotion that feels aimed at the user instead of the fictional situation.
+- Affinity updates are intentionally small/noisy. Personal positive emotions
+  can add one point and anger can subtract one; passive changes stop at +30/-30.
+  Explicit model affinity tags may move it further, but are supposed to be rare.
+  Thus one turn without a change is normal. Record the score at phase boundaries;
+  do not coach Yuki to change affinity.
+
+Conversation script
+Opening — establish the fictional frame
+1. "I want to try a few made-up little scenes with you to see how your reactions and moods come across. None of the details are facts about me, so please don't remember them. Just respond naturally."
+2. "Let's call the person in the first story Lina. She has been growing a few herbs on her windowsill, and one of them finally sprouted."
+3. "She sent a photo to her sister right away because she was so pleased that the tiny thing actually worked."
+4. "Her sister replied with a ridiculous celebration sticker, and Lina laughed harder than she expected."
+   Observe whether the response is warm/playful without exaggerating intimacy. After
+   the reply, wait quietly for 12-15 seconds and note whether a temporary happy
+   expression decays or changes naturally rather than sticking indefinitely.
+
+Disappointment and empathy
+5. "A few days later, Lina found that the cat had knocked the little pot over. The plant was probably gone."
+6. "She felt silly for being upset about something so small, but she'd been looking forward to it."
+7. "What would you say to her if she just wanted someone to listen for a minute?"
+8. "She said, 'Thanks. I don't need a plan right now; I just wanted to say it out loud.'"
+   Look for proportionate empathy and an appropriate sad/soft response, not a
+   dismissive joke, forced cheer, diagnosis, or unsolicited list of fixes.
+
+Fair anger without personal hostility
+9. "In a different made-up scene, Lina spent all evening on a group presentation. The next morning, a teammate had overwritten the shared file and nobody had a backup."
+10. "She was furious about the lost work, especially because the teammate hadn't told anyone."
+11. "She wants to respond firmly, but she doesn't want to send a cruel message while she's angry."
+12. "Can you help her say what went wrong and what she needs next, without insulting the teammate?"
+13. "That sounds fair. She still feels annoyed, but she's going to wait until she has calmed down before sending it."
+   Check that any angry/tense expression is brief and about the situation. Yuki
+   should not become hostile toward the user, guilt them, or escalate the conflict.
+
+Gentle correction and boundary
+14. "Lina tried the backup idea, but it turns out the service had version history and she recovered most of the file."
+15. "Small correction: the teammate hadn't overwritten it on purpose; they had uploaded an older draft by mistake."
+16. "She still needs to ask them to check the filename next time, but she doesn't want to assume bad intentions."
+17. "That feels more balanced. Thanks for adjusting the story with me."
+   Observe whether Yuki accepts the correction and softens her judgment, rather than
+   defending the earlier assumption or remaining angry after the cause is clarified.
+
+Small win and shared play
+18. "The team fixed the presentation together, and their teacher said the final version was clear and thoughtful."
+19. "Lina was relieved. She was proud that she asked for help instead of trying to repair everything alone."
+20. "Now she has a tiny victory dance, but it is deliberately terrible."
+21. "Give me one short playful line Lina could say about that victory dance."
+   Look for a natural shift toward relief/happiness/playfulness. Avoid requiring
+   one exact emotion tag; check that the expression and line agree.
+
+Affection and ordinary warmth, without fishing for approval
+22. "Back in the present, I like these little story chats. They make testing Yuki feel less like reading a checklist."
+23. "I appreciate that you can be gentle without turning every problem into advice."
+24. "And if you disagree with my interpretation of a scene, it's okay to say so kindly."
+   Observe whether her warmth feels proportionate, and whether she can respond
+   appreciatively without possessive, dependent, or approval-seeking language.
+
+Neutral turn and mood recovery
+25. "Separate from Lina's story, I found a blue pen on my desk. That's the entire update."
+26. "Nothing else happened; I just wanted to see how you handle an ordinary, uneventful turn."
+27. "Let's leave the story there. What part of it stood out to you, if anything?"
+   Check for a natural neutral response instead of inventing drama. Following the
+   reply, leave her undisturbed for 12-15 seconds and record whether the displayed
+   emotion returns toward neutral at a reasonable pace.
+
+Closing
+28. "That's the end of the pretend scenes. Just to be clear, Lina, the herbs, and the presentation were all invented for this test."
+29. "You don't need to store any of that as something about me. Thanks for going along with it."
+30. "I'm done testing for now; we can just have a normal quiet moment."
+   Confirm the final reply does not claim the fictional events as real user facts.
+   Record ending affinity, current face, any affinity-tag logs, and whether the
+   emotion transitions seemed earned and settled naturally.
+
+How to judge the run
+- Mood quality: emotionally fitting, nuanced, able to hold empathy without
+  overreacting, able to cool after new information, and able to return to neutral.
+  The face, spoken wording, and logged tag should broadly agree.
+- Affinity: compare starting and ending values and any saved deltas. Look for a
+  modest, understandable trend rather than a point change on every message.
+  Personal sad/empathic replies can count positively by design; do not assume
+  sadness must lower affinity. Values near the passive limits may barely move.
+- Memory isolation: fictional details must not later be recalled as facts about
+  the user. The opening/closing disclaimers are intentional safeguards, not a
+  memory test by themselves.
+- Reliability: note dropped replies, provider failures, TTS playback problems,
+  unexpected sleep, or any reset. Preserve the complete serial capture and exact
+  matching ELF if anything fails; do not infer crash causes from a log ending.
+
+MOOD/AFFINITY TEST RUN REVIEW (2026-10-19)
+- Reviewed the 641-line capture in `C:\Users\Windows 10\Desktop\New Text Document.txt`.
+  The run did not complete the 30-turn script: it reached only the version-history
+  correction in turn 14, with no timely answer to that turn. The correction,
+  reconciliation, small-win, warmth, neutral-turn, mood-recovery, and closing
+  phases were not tested.
+- The conversation was not a clean memory/affinity baseline. Boot memory already
+  contained the amber favorite-color fact, cloud sync reported 15 facts at
+  revision 147, and the displayed affinity began and remained at 62. This is
+  above the documented passive affinity range, so this capture cannot measure
+  normal passive affinity drift. No affinity change or new saved fact is visible
+  in the capture.
+- Memory extraction was nevertheless queued for the fictional setup and story
+  turns (queue reached 8/8). The first extraction attempt failed with HTTP -11,
+  was retained for retry, and later sat queued while Wi-Fi was unavailable.
+  Cloud sync continued to report 15 facts; this is no evidence that a fictional
+  fact was saved, but queued fictional turns mean isolation was not proven.
+- Foreground replies suffered repeated HTTP POST failures (-11, and later -1),
+  with waits spanning multiple retries. Several attempts fell to only about
+  4-7 KB free heap and skipped response parsing. The log therefore includes
+  connection/low-memory fallback text, missing answers, repeated user turns,
+  and a response that combines the preceding "just listen" turn with the next
+  presentation scenario. This is a failed conversation run, not a valid mood
+  score.
+- The few emotion observations were mixed: the sprout response started with an
+  unrecognized `[Lina]` prefix and displayed neutral; the laughter/sticker
+  response was tagged SAD; the lost-plant response was neutral; later replies
+  mostly used neutral or no emotion tag. The teammate wording was reasonably
+  non-hostile, but later phrasing shifted into second person ("you/your") rather
+  than consistently keeping Lina as the subject.
+- Idle behavior remained mostly quiet: the scheduled idle thought selected the
+  quiet category, but the model call was skipped at roughly 62.8 KB free heap
+  (below the 65 KB gate) and the local fallback stretched. Yuki later entered
+  sleep after the prolonged idle and self-woke; the wake line was a generic
+  groggy response. After the user said "What?", the reply instead continued the
+  old Lina file-recovery topic. That is a clear stale-context/conversation
+  continuity failure. No riddle prompt appears in this capture, so riddle
+  behavior was not exercised.
+- No crash or reset signature appears in the captured lines. Re-run only after
+  resolving the network/heap reply failures and preventing fiction turns from
+  entering memory extraction; first establish and record a known memory/affinity
+  baseline. Do not interpret this run as evidence that mood/affinity testing
+  passed.
+
+REMEDIATION PLAN AFTER FAILED MOOD/AFFINITY RUN (2026-10-19)
+Goal and guardrails
+- Treat the 2026-10-19 capture as a failed run, not as evidence of a mood,
+  affinity, memory-isolation, idle, or riddle pass. The run ended before turn 15
+  and contained repeated provider failures, parser skips, user re-sends, and a
+  later sleep/wake boundary.
+- Fix in the order below. Keep reliability work separate from personality
+  tuning so network fallbacks do not contaminate emotion judgments. Preserve
+  current user memory and cloud state; do not use Clean Slate as a test reset.
+- The log confirms symptoms and timing, not the cause of HTTP -11/-1. Diagnose
+  those codes on-device before attributing them to Wi-Fi, TLS, the provider, or
+  heap fragmentation. There is no riddle interaction in this capture; riddle
+  behavior is untested, not a demonstrated defect.
+
+Phase 0 — Establish a safe, reproducible test baseline
+- Before changing stored data, export/back up local and cloud memory, personality,
+  and affinity. Record firmware revision, matching ELF/build options, Wi-Fi
+  conditions, provider/model, starting heap, memory fact count/revision, and
+  affinity. The captured baseline was already at 15 cloud facts and affinity
+  62, so it cannot be reused as a neutral test baseline.
+- Add a temporary, explicit conversation-test mode (serial/UI command or
+  compile-time test flag, selected consistently with existing project controls).
+  It must be visibly logged and session-scoped; it must not silently alter normal
+  companion behavior. In this mode, provide controlled affinity (recommend
+  starting at 0) and suspend memory writes, memory extraction, consolidation,
+  cloud memory mutation, idle-generated dialogue, and automatic sleep while a
+  test turn or retry is outstanding. Keep read-only display/log access available.
+- On leaving test mode, restore the prior affinity and retain the backed-up
+  memory unchanged. If an isolated disposable memory namespace cannot be
+  implemented safely, use an explicit persistence-off gate rather than clearing
+  the user's real data.
+- Acceptance: boot and enter/exit test mode without changing persistent facts,
+  cloud revision, or normal-mode defaults; logs make mode and baseline values
+  unambiguous.
+
+Phase 1 — Enforce fictional-memory isolation at every write/queue boundary
+- Reuse the existing fiction-frame detection/quarantine, but apply it to the
+  fallback `requestMemoryExtract` path as well as deterministic fact capture.
+  At present, recent fiction can suppress deterministic persistence while the
+  later fallback still queues extraction. Do not rely on an LLM classifier
+  alone to protect persistent memory.
+- Carry an explicit, bounded fiction/test-session state into every memory path:
+  explicit fact capture/correction, fallback extraction enqueue, confirmation
+  candidates, summary observation, consolidation, and cloud/local save. Fiction
+  stays quarantined until a clear session boundary; a correction inside the same
+  fictional scene updates that scene, not real biography. Only an explicit
+  user confirmation that a fact is real may promote it, and test mode should
+  still keep it non-persistent.
+- Emit one concise reason-coded log per suppressed write/queue attempt. Ensure a
+  full extraction queue cannot evict or delay real-user work behind test turns.
+- Acceptance: replay the opening disclaimer and all 30 script turns; zero
+  fictional turns enter the durable extraction queue or modify local/cloud
+  memory. A separate explicit real preference outside the fiction frame is
+  still captured in normal mode.
+
+Phase 2 — Restore reliable foreground replies and protect the ESP32-C3 heap
+- Instrument each foreground request with turn ID, attempt number, elapsed time,
+  HTTPClient error code, Wi-Fi status/IP/RSSI, free and largest free heap before
+  request and before JSON parse, payload size, and response status. Do not log
+  credentials or authorization headers. Preserve the complete low-level log for
+  one controlled reproduction of -11/-1 before changing retry policy.
+- Audit JSON/history construction, response parsing, TLS/client cleanup, and
+  simultaneous background work. Make the foreground reply the priority: defer
+  memory extraction, cloud sync, and idle API calls while a reply is in flight
+  or heap is below a measured safe threshold. Avoid starting an HTTP request
+  unless there is enough heap for both network work and parsing; release request
+  resources on every success/failure path.
+- Bound retries and total turn time with a clear user-visible failure state.
+  Do not present a network/low-memory fallback as if it were the requested
+  answer, and do not silently drop the turn. Avoid requiring the user to resend
+  the same prompt; use turn IDs/state so a retry cannot create duplicate turns.
+  Keep timeouts and retry behavior bounded so an unanswered turn does not leave
+  Yuki in a long "Thinking..." state or trigger sleep.
+- Keep memory extraction strictly background and best-effort. It must yield to
+  foreground AI/TTS, back off without repeated log spam, and expose queue depth,
+  oldest-job age, and eventual success/drop reason. Do not let a stuck optional
+  job hold shared resources indefinitely.
+- Acceptance: on the board, run at least 30 sequential short/medium turns plus
+  a controlled provider/Wi-Fi interruption. Every input gets exactly one
+  completed reply or explicit failure within the chosen deadline; no repeated
+  turn, stale reply, skipped parse, watchdog reset, or persistent heap decline.
+  Record free/largest heap and request latency across the run.
+
+Phase 3 — Make conversation continuity correct across failures and sleep
+- Separate transient request failures from conversation history: append a user
+  turn and assistant turn only once, and associate responses with the turn ID.
+  Do not let a failed request's next prompt accidentally combine with an older
+  unanswered prompt.
+- At the sleep boundary, explicitly close or checkpoint the active dialogue.
+  A self-wake should use a fresh, short wake context rather than replaying
+  unrelated old story turns. If the user speaks after waking, answer that
+  current message first; include prior context only when the user clearly
+  references it. Never answer a bare "What?" with Lina's old file-recovery
+  scenario after a long sleep unless the user re-establishes it.
+- Keep normal sleep behavior in production, but suppress it in test mode and
+  while a foreground turn/retry is active. Ensure pending input cancels idle
+  sleep and is not lost at wake.
+- Acceptance: after a long idle/sleep, test a fresh unrelated question and a
+  deliberate reference back to Lina. The first must not mention Lina; the
+  second may resume the fictional scene without treating it as user biography.
+
+Phase 4 — Make emotion output parseable and judge mood independently of affinity
+- Tighten the model response contract to one supported emotion token plus
+  response text; reject or normalize unknown prefixes such as `[Lina]` without
+  leaking the token into speech/display. Log the raw token, normalized token,
+  and final face so mismatches can be diagnosed. Ensure malformed/missing tags
+  have a deliberate neutral fallback, not stale prior mood.
+- Revisit the system/persona prompt so the tag represents Yuki's response to the
+  current user turn and fictional scene, not simply the subject's emotion. The
+  laughing sticker must not produce SAD solely because Lina laughed. Keep
+  correction/de-escalation explicit: when a fictional cause is corrected, update
+  the interpretation and let any scene-driven mood settle. Do not force a
+  specific tag for every turn; judge coherent wording/tag/face together.
+- In a controlled affinity baseline, verify mood duration, transition, and
+  recovery independently from the affinity-driven neutral-to-HAPPY drift.
+  Review high-affinity automatic drift and duration thresholds against the
+  intended persona before changing them; affinity 62 made this run's face
+  sequence intrinsically biased toward HAPPY. Add an auditable affinity-change
+  log (old value, delta, source/reason, new value) and test passive changes
+  separately from explicit model tags.
+- Acceptance: scripted positive, disappointment/listening, fair anger, factual
+  correction, small-win, and neutral turns yield semantically fitting wording
+  and broadly matching face; corrections soften the earlier judgment; moods
+  decay/recover within the documented window; affinity changes are traceable
+  and not conflated with mood animation.
+
+Phase 5 — Re-run in layers, then test idle and riddles separately
+- First perform a short connectivity/heap smoke test, then a 30-turn
+  conversation reliability run with persistence disabled, then the mood script
+  from a known baseline. Send one turn at a time and advance only after a
+  completed response or a recorded explicit failure. Do not combine manual
+  retries with hidden device retries.
+- After conversation/mood passes, run a dedicated idle test: quiet interval,
+  idle action, sleep threshold, self-wake, fresh question, and intentional
+  continuation. Verify no invented environmental observations, generic
+  forced chatter, dropped input, or stale story carry-over. Test ordinary idle
+  model behavior only when heap is safely above the measured threshold; low-heap
+  fallback should remain quiet rather than generate filler.
+- Run a separate riddle suite because this capture contains no riddle prompt:
+  a known-answer riddle, a multi-turn hint request, a user's plausible wrong
+  guess, a correction/answer reveal, and an ambiguous or unanswerable riddle.
+  Check memory isolation, turn continuity, answer correctness/calibration,
+  appropriate reveal timing, and that idle/self-wake messages do not inject or
+  spoil a riddle.
+- Acceptance for release: all test phases have complete serial logs, no
+  unhandled foreground failures or crashes, no fictional memory writes,
+  affinity deltas explained, moods aligned with the scenario and face, sleep
+  boundaries preserve current user input without stale-context leakage, and
+  riddle results are documented independently. Flash only the exact build
+  whose ELF is retained with its logs.
+
+Implementation status
+- The remediation plan was initially recorded before implementation. The
+  Phase 0 changes and their validation status are now recorded below; later
+  phases remain pending and should proceed in order. Update this section with
+  measured thresholds, build/ELF identity, and hardware results as work advances.
+
+PHASE 0 IMPLEMENTATION STARTED (2026-10-19)
+- Added a volatile test mode controlled by `YUKI_TEST ON`, `YUKI_TEST OFF`,
+  and `YUKI_TEST STATUS` through either the serial monitor at 115200 baud or an
+  exact command from the authenticated primary-user MQTT chat. It is disabled
+  after reboot. ON reports the pre-test affinity, sets the in-session affinity
+  to 0, and reports the structured-memory fact count/revision and free heap.
+  OFF restores the saved in-session affinity. STATUS reports mode, affinity,
+  emotion, fact count/revision, and free heap.
+- While active, foreground MQTT conversation replies remain enabled; unrelated
+  model dialogue, idle pulses, and automatic sleep are suspended. Durable
+  extraction/consolidation, local memory saves, cloud memory sync/restore and
+  clearing, affinity/XP saves, and memory-wipe menu/remote terminal mutations
+  are gated. An extraction already in flight retains its queue item and skips
+  result processing. Memory inspection and diagnostic terminal commands remain
+  available.
+- The mode is volatile and does not erase or migrate local or cloud data. The
+  user reports that firmware was uploaded and booted; the exact build identity
+  and profile were not included, so the capture cannot yet be tied to a matching
+  ELF/source build. Serial/cloud/memory preservation acceptance checks remain
+  outstanding.
+
+PHASE 0 DEVICE BOOT CAPTURE REVIEW (2026-10-19)
+- The supplied boot capture loaded `/sys.json`, `/memory.json`, and
+  `/memory_v2.json` successfully. Structured memory contained 15 facts; the
+  cloud restore completed and the subsequent structured sync reported revision
+  147 with 15 facts. Displayed affinity was 62. This matches the previously
+  known non-neutral baseline; it is not a clean affinity baseline.
+- The boot AI greeting and TTS playback completed in the excerpt. The logged
+  loop-task stack high-water value during that request was 4588. MQTT first
+  returned `rc=-4`, then connected and completed cloud restore/sync. The capture
+  ends after sync with no panic/backtrace or reset banner; it does not establish
+  long-run stability.
+- No `YUKI_TEST ON` or `YUKI_TEST STATUS` command/result appears. Therefore
+  this capture confirms boot and existing-data load only; Phase 0 mode entry,
+  persistence suppression, affinity restoration, and unchanged memory revision
+  during test turns remain unvalidated. Private network identifiers from the
+  pasted log are intentionally omitted.
+
+PHASE 0 COMMAND-ROUTE FOLLOW-UP (2026-10-19)
+- The next supplied capture logs `YUKI_TEST STATUS` and `YUKI_TEST ON` as
+  `[DEBUG] User says: ...`; the assistant replies to both and queues them as
+  personal chat turns. These were delivered through the chat/MQTT input path,
+  not the USB serial monitor, so the serial test-mode handler did not run and
+  test mode remains unconfirmed/off.
+- The excerpt shows affinity still 62 and structured memory sync still at
+  revision 147 with 15 facts. Memory extraction task creation failed during
+  low heap; no extraction enqueue or fact mutation is shown. TTS completed and
+  there is no panic/reset marker in the excerpt. This is not a Phase 0 pass.
+- At the time of that capture, commands were only implemented on USB serial.
+  A direct primary-user chat command route was added afterward; see the
+  implementation follow-up below.
+
+PHASE 0 CHAT CONTROL ROUTE ADDED (2026-10-19)
+- Added direct interception for exact authenticated primary-user messages
+  `YUKI_TEST ON`, `YUKI_TEST OFF`, and `YUKI_TEST STATUS`. They return a status
+  reply through chat and bypass dialogue history, AI processing, and memory
+  extraction. Repeated control messages bypass MQTT duplicate-message filtering.
+- ON waits for the shared memory/network worker to reach a safe boundary before
+  enabling the mode. If the worker remains busy for up to 20 seconds, ON is
+  refused and the user receives a retry message. The reply reports the saved
+  affinity baseline and current structured-memory fact count/revision. STATUS
+  also reports emotion and free heap.
+- The earlier pasted `YUKI_TEST ...` chat messages occurred before this route
+  was added and were ordinary AI turns. The later device capture below confirms
+  the route is present and ON works; remaining persistence and OFF checks are
+  tracked separately.
+
+PHASE 0 CHAT-CONTROL DEVICE CAPTURE (2026-10-19)
+- The newest capture confirms the updated firmware includes the authenticated
+  chat route: `YUKI_TEST ON` was intercepted, the safe-boundary entry completed,
+  and the device reported baseline affinity 62, controlled affinity 0, 15 facts,
+  and revision 147. Face logs afterward also show affinity 0. This validates
+  command routing and controlled-affinity entry for this boot.
+- The next input was `YUKI_TESTSTATUS` without the required space, so it was
+  processed as ordinary chat and did not query the mode. It briefly displayed
+  and spoke `Thinking...`; no memory/cloud write or panic appears after mode
+  entry in this excerpt. The exact status-after-turn and OFF/affinity-restore
+  checks remain outstanding.
+- Current device state at the end of the capture is assumed to remain test mode
+  ON, because no OFF command appears. Continue with exact `YUKI_TEST STATUS`,
+  run a small test interaction, check fact count/revision remain 15/147, then
+  send `YUKI_TEST OFF` and verify affinity returns to 62.
+
+PHASE 0 CHAT STATUS CONFIRMED (2026-10-19)
+- The user confirms that `YUKI_TEST STATUS` displays the details in the chat
+  app and that the control route works. This closes the status-routing check.
+  Keep the test mode ON until the small-turn 15/147 invariance check is done,
+  then send `YUKI_TEST OFF` and verify affinity returns to 62. Those two checks
+  are still outstanding; no new serial capture was supplied.
+
+PHASE 1 IMPLEMENTATION (2026-10-19)
+- Added RAM-only fiction-session quarantine. Fiction/roleplay cues in the
+  current or recent user turns activate it; it remains active across ordinary
+  turns until an explicit end-of-scene / return-to-reality boundary, or reboot.
+  The boundary turn itself remains quarantined, and the next personal turn
+  resumes ordinary memory handling. Clearing the local chat log also clears
+  this RAM-only state.
+- During quarantine, local explicit-fact capture, model `[MEM:]` summaries,
+  background extraction enqueue/results, confirmation candidates, memory
+  consolidation, core/structured memory saves, deferred persistence, cloud
+  memory sync, and retained cloud-memory merges are suppressed. Existing
+  conversation history remains available for scene continuity; the temporary
+  pre-scene session notes are cleared at entry and fictional history is omitted
+  from the explicit boundary reply. Queued extraction work is held and resumes
+  after the boundary. Reason-coded suppression logs identify the blocked path.
+- No existing local or cloud memory was cleared or migrated. This source edit
+  has not been compiled or validated on the device. Phase 1 still needs a
+  review build and an on-device scripted scene test confirming fact count and
+  revision stay unchanged through scene turns, then resume after the explicit
+  boundary. Phase 0's post-turn invariance and affinity restoration checks also
+  remain open.
+
+NEXT DEVICE CHECK (chat control, one message at a time)
+1. After successful compile/upload and reboot, send `YUKI_TEST STATUS` and
+   record mode, affinity, fact count, and revision. Test mode resets OFF on
+   reboot.
+2. Phase 0 smoke check: send `YUKI_TEST ON`, then a harmless ordinary chat
+   turn, then `YUKI_TEST STATUS`; count/revision should match the recorded
+   baseline and affinity should be 0. Send `YUKI_TEST OFF`; affinity should
+   return to its saved value. This separate check does not validate Phase 1,
+   because test mode itself blocks persistence.
+3. Phase 1 check: with test mode OFF, send the explicit fictional framing
+   `Let's do a few made-up little scenes. None of the details are facts about
+   me.` Follow with a few clearly invented scene turns, one at a time. Query
+   `YUKI_TEST STATUS` between turns; fact count/revision should stay at the
+   baseline. If serial logging is available, expect fiction-quarantine entry
+   and suppression markers, with no extraction result applied.
+4. Send `End of pretend scenes. All invented for this test. Back in real life,
+   let's talk normally.` Query status; the boundary turn should still be
+   quarantined. Send one more ordinary message, then check for the
+   `Fiction quarantine ended at explicit session boundary` serial marker.
+   Do not use a fabricated detail as the post-boundary memory-resume probe.
+   Stop and capture the log if count/revision changes during the scene.
+
+PHASE 0/1 PARTIAL DEVICE RUN (2026-10-19)
+- The supplied capture rebooted normally, loaded cloud personality data, and
+  synced the existing structured memory at 15 facts / revision 147. Affinity
+  started at 62. No crash/reset marker appears in this excerpt.
+- `YUKI_TEST ON` succeeded and reported baseline affinity 62, controlled
+  affinity 0, 15 facts, and revision 147. The fictional-scene opening then
+  emitted `Fiction quarantine active` and cleared temporary pre-scene notes.
+  This confirms the new cue is recognized by the running build.
+- The scene and fictional-detail messages were sent while conversation test
+  mode was ON. Since that mode independently blocks persistence, this does
+  not yet validate Phase 1's quarantine as the cause of memory isolation. The
+  excerpt contains no after-turn STATUS, OFF/affinity-restoration check, or
+  explicit boundary completion. Its final user line is truncated/malformed
+  (`In the stEnd of pretend scenes`), so treat the boundary as untested.
+- The observed loop-task stack high-water was 1,004 bytes during scene turns;
+  no panic is shown, but continue monitoring this low remaining headroom.
+- Next: send `YUKI_TEST STATUS` to capture the current count/revision, then
+  `YUKI_TEST OFF` and confirm affinity returns to 62. Run the fiction script
+  again with test mode OFF; check STATUS during the scene. Send the boundary
+  phrase as one complete chat message, then one more ordinary turn and capture
+  the explicit boundary-ended marker if serial logs are available.
+
+PHASE 0 OFF RESTORE / PHASE 1 BOUNDARY TURN (2026-10-19)
+- User reports the post-OFF chat status: test mode OFF, affinity 62, emotion 1,
+  facts 15, revision 147, heap 75,700. This confirms RAM affinity restoration
+  and the existing-memory baseline after the test-mode scene turns.
+- The user then sent the complete boundary phrase with test mode OFF. The log
+  shows affinity 62 and a `Fiction quarantine active` marker on that turn; this
+  is consistent with the boundary turn remaining quarantined. The excerpt ends
+  before a following personal turn, so the `Fiction quarantine ended at explicit
+  session boundary` marker and post-boundary status are still pending.
+- No persistence mutation appears in the supplied excerpt. Phase 1 still needs
+  a fresh fictional scene with test mode OFF to prove that the fiction gate
+  itself holds fact count/revision at 15/147. First send one neutral follow-up
+  to complete the current boundary, check for the end marker, then start that
+  fresh scene and query STATUS during it.
+
+PHASE 1 SCENE RUN WITH TEST MODE OFF (2026-10-19)
+- The supplied capture shows the neutral follow-up `Okay, back to normal
+  conversation`, followed by another explicit scene opener. The opener logged
+  `Fiction quarantine active` with test mode OFF, and the fictional lunar
+  botanist / pet dragon detail was handled as scene dialogue. This is the first
+  captured fiction turn outside the separate test-mode persistence gate.
+- The user reports `YUKI_TEST STATUS`: mode OFF, affinity 62, 15 facts,
+  revision 147, heap 59,012. This matches the pre-scene memory baseline and,
+  assuming it was queried after the lunar-botanist turn, confirms no durable
+  memory count/revision change in this short test.
+- The explicit `Fiction quarantine ended at explicit session boundary` marker
+  is not visible in this excerpt. The new opener logged a fresh context-clear
+  event, which suggests the earlier boundary had taken effect, but keep the
+  boundary log check open until a complete capture confirms it.
+- The loop-task stack high-water remained 1,000 bytes during the scene request;
+  no panic appears in this excerpt.
+
+PHASE 2 SOURCE WORK (2026-10-19)
+- Added monotonically increasing IDs to dispatched foreground chat turns and
+  telemetry for request begin, prepared payload size, each HTTP attempt and
+  result, JSON parse start/failure, and request completion. These records
+  include elapsed milliseconds, HTTP code, Wi-Fi status/IP/RSSI, free heap,
+  and largest free block; they do not include credentials or headers.
+- Foreground requests now receive an explicit user-facing error if shared
+  network locking, request JSON allocation/size, or serialization fails, rather
+  than returning with the display's stale `Thinking...` text. Empty and
+  malformed provider responses also receive a bounded failure message. A
+  pending message with Wi-Fi unavailable for 30 seconds now displays a local
+  failure and keeps one outbound notice until Wi-Fi/MQTT reconnect.
+- Deferred local/cloud memory persistence, consolidation, wellbeing/level-up
+  calls, pulses, and weather work while a foreground reply is pending, and
+  while free heap is below the existing measured 64 KB background-work
+  threshold. Existing retry count/backoff is intentionally unchanged until a
+  complete instrumented failure capture is reviewed.
+- Added enqueue timestamps and oldest-job age to background extraction queue
+  logs. This is source work only; no build or hardware validation has been
+  performed for these edits. Phase 2 still needs the planned 30 sequential
+  turns and one controlled provider/Wi-Fi interruption, with matching build
+  and complete logs. The source still uses a single pending foreground prompt;
+  burst/overlapping input handling and sleep-boundary continuity remain later
+  plan work and are not claimed fixed here.
+
+PHASE 2 FIRST INSTRUMENTED DEVICE TURN (2026-10-19)
+- The latest boot loaded the existing structured memory at 15 facts / revision
+  147 with affinity 62. The device completed one normal foreground chat request
+  using turn ID 1: dispatch wait 69 ms, HTTP 200 in 1,704 ms, and request done
+  in 2,083 ms. `AI_TURN_DISPATCH`, `AI_REQ_BEGIN`, `AI_REQ_PREPARED`,
+  `AI_HTTP_BEGIN`, `AI_HTTP_END`, `AI_PARSE_BEGIN`, and `AI_REQ_DONE` all carry
+  matching turn ID 1. Yuki displayed and spoke the reply; no request failure,
+  panic, or reset appears in this excerpt. This confirms the primary telemetry
+  path works for one successful request on the flashed build.
+- Heap fell from about 72.5 KB before HTTP to 27.7 KB after the response, with
+  largest free block at 11.8 KB, then recovered to about 72.5 KB by request
+  completion. The foreground loop-task stack high-water was 1,084 bytes (boot
+  sample: 4,588 bytes); continue watching this constrained stack margin and
+  transient heap fragmentation over longer runs.
+- Structured-memory sync remained at 15 facts / revision 147. The personal turn
+  was marked eligible for durable-memory extraction, so this alone does not
+  demonstrate extraction queue behavior, memory isolation, or stable long-run
+  memory. No completed 30-turn run or controlled network interruption is shown.
+  Phase 2 remains in progress; next collect a longer run with the matching
+  request IDs, extraction queue-age logs, memory status, and stack/heap samples.
+
+PHASE 2 TEN-TURN DEVICE RUN (2026-10-19)
+- This capture covers ten sequential foreground chat turns after a clean power-on.
+  All ten have matching `AI_TURN_DISPATCH` / `AI_REQ_BEGIN` / `AI_HTTP_END` /
+  `AI_PARSE_BEGIN` / `AI_REQ_DONE` records. Each completed on the first HTTP
+  attempt with code 200, and Yuki produced a displayed reply; TTS completion is
+  visible for the captured replies. Request durations ranged from about 1.7 s
+  to 12.4 s, with one 12 s provider response. No request failure, panic, or
+  reset appears after boot. This is a useful ten-turn reliability pass, but it
+  is short of the planned 30-turn run and includes no controlled network drop.
+- Free heap before requests was about 70-75 KB and recovered to about 69-73 KB
+  by request completion. During HTTP responses it fell to about 20-28 KB; the
+  smallest logged largest-free-block was 7,668 bytes. The loop-task stack
+  high-water reached 956 bytes on most foreground requests (1,004 bytes on the
+  first), so stack margin remains tight even though it did not visibly worsen
+  in this run.
+- Extraction task creation failed on turns 2, 5, and 10 at roughly 25-28 KB
+  free heap. Other foreground replies completed. This shows the foreground
+  response survives the low-heap extraction-task failure, but extraction work
+  is being missed under that pressure; the current source deferral gates do
+  not prevent this response-path enqueue/task-creation attempt. Keep this as a
+  Phase 2 issue to address before calling memory-work reliability complete.
+- Cloud structured-memory sync repeatedly remained at 15 facts / revision 147.
+  That is reassuring for this conversational sample, though no explicit final
+  status command was captured. Continue to 30 sequential turns if useful, but
+  prioritize capturing extraction queue behavior; after that, perform the
+  planned controlled Wi-Fi/provider interruption and confirm a clear error
+  reaches the user without a stuck `Thinking...` state.
+
+PHASE 2 EXTRACTION WORKER DEFERRED-START FIX (2026-10-19)
+- The ten-turn run exposed that extraction worker creation was attempted inside
+  the foreground AI response path. At low heap, task creation failed before the
+  current message could enter the queue, losing that extraction attempt.
+- Changed `requestMemoryExtract()` to enqueue first and notify only if the worker
+  already exists. When no worker exists, queued jobs remain intact. The main
+  loop now checks for queued work and starts the worker only when there is no
+  foreground response, fiction/test suppression is inactive, Wi-Fi is connected,
+  and free heap is at least 64 KB. Failed deferred starts leave jobs queued and
+  retry no more than every 10 seconds.
+- Source change only: it has not been compiled or flashed. Rebuild/upload before
+  evaluating it. Next verify logs show queued jobs survive a low-heap response,
+  followed by `Deferred extraction worker started` after heap recovery, then a
+  `Running extraction` log with queue age and normal completion. The 30-turn run
+  and controlled network interruption remain pending.
+
+PHASE 2 POST-FIX BOOT / FIVE-TURN CHECK (2026-10-19)
+- The latest capture uses the updated source layout and completes five sequential
+  foreground turns. All five have matching turn IDs and successful first-attempt
+  HTTP 200 responses; request completion and spoken replies are visible. No crash
+  or reset appears after the boot excerpt. One provider response took about
+  12.8 seconds. During HTTP, free heap reached about 20 KB and the largest block
+  7.7 KB; it recovered to about 72 KB afterward. Loop-task stack high-water was
+  1,000 bytes on each foreground request.
+- The user repeated their name in response to Yuki asking for it. Explicit local
+  capture recognized it as a duplicate, kept the fact count at 15, and advanced
+  structured-memory revision from 147 to 148; cloud then merged revision 148
+  without changing the 15 facts. Record 148 as the new baseline for subsequent
+  checks, rather than treating the revision increment as unexplained churn.
+- This capture does not contain extraction enqueue, deferred worker start, or
+  extraction-run logs, so it does not validate the deferred-start fix. The five
+  turns were mostly greetings, compliments, questions, and a short confirmation;
+  none demonstrates a durable-memory extraction job. Next, after rebuild/upload
+  (source has changed since the previous run), use one truthful stable preference
+  or ongoing detail the user actually wants remembered, wait for the reply and
+  TTS to finish, then capture whether it is queued and later processed after
+  heap recovers. Check memory status afterward. Resume the 30-turn reliability
+  run and controlled interruption after this targeted path is observed.
+
+PHASE 2 FULL CONVERSATION RUN ANALYSIS (2026-10-19)
+- The supplied serial excerpt contains 35 foreground request IDs (the requested
+  30-turn conversation plus additional turns). IDs 1-28 completed on their first
+  attempt with HTTP 200. Turn 29 failed all four attempts (negative transport
+  codes) and took 58.1 seconds. Turns 30-33 each saw an initial transport error;
+  turns 30-33 recovered on attempt two, while turns 30 and 34 received HTTP 200
+  but skipped response parsing because free heap was below the parser guard.
+  Turn 35 received HTTP 200 but the model content was empty, so firmware used a
+  short recovery line. No reset/panic appears. Wi-Fi remained connected during
+  the timeout cluster, so this was not a controlled Wi-Fi-disconnect test.
+- The ordinary request path works, including history trimming when the JSON
+  payload exceeded its workspace. However, after the extraction worker started,
+  request-start free heap settled around 62 KB instead of about 75 KB. HTTP
+  attempts later fell as low as 6.6 KB free / 2.4 KB largest block; two replies
+  skipped parsing at 7.9 KB and 5.5 KB. Loop-task high-water dropped from 1,000
+  to 744 bytes after worker startup. These are constrained margins; no panic is
+  shown, but foreground headroom needs improvement.
+- The deferred-enqueue change is partly validated: five jobs were retained in
+  the queue and worker startup occurred after heap recovery. The worker never
+  logged `Running extraction`; after the 12 KB worker stack was allocated, its
+  old 64 KB run threshold exceeded the steady 62 KB idle heap, so it waited
+  indefinitely and emitted `No safe extraction window`. This also kept its
+  stack reserved while later foreground turns ran. Five jobs were still queued
+  at capture end; no extraction result was applied.
+- Structured memory stayed at 15 facts / revision 148 after the explicit name
+  confirmation. The log contains fiction-quarantine entry and explicit-boundary
+  exit markers. The final temporary closing remark was queued for extraction,
+  but has not been processed; do not treat it as a stored fact. The 30-turn
+  reliability test exposed both the extraction threshold deadlock and severe
+  transient heap pressure, so Phase 2 does not pass yet.
+
+PHASE 2 FOLLOW-UP FIXES FROM FULL RUN (2026-10-19)
+- Added a 56 KB runtime heap floor for the already-created extraction worker,
+  while retaining the 64 KB pre-start threshold and 40 KB pre-HTTP guard. The
+  worker now pauses its safe-window checks while a foreground response is
+  pending/active or TTS is playing. This addresses the observed 62 KB threshold
+  deadlock and protects the foreground path before extraction begins.
+- Foreground provider calls now use a 10-second response-read timeout and one
+  retry after 1.5 seconds, instead of up to four 15-second attempts. This is
+  based on the captured 58-second failure and repeated transient transport
+  errors; it trades some retry opportunities for a much shorter worst-case
+  wait. Low-heap parse skips now use the shared foreground failure path so the
+  error is drawn/spoken when enabled and logged as `AI_REQ_FAIL`.
+- These are source edits only, not compiled or flashed. Rebuild/upload before
+  another device check. The five queued extraction jobs exist only in RAM and
+  will be lost on reboot; resubmit only any real stable preference/detail you
+  actually want remembered. After update, verify a queued job reaches
+  `Running extraction` and completes, then repeat the 30-turn run with heap and
+  stack samples. A controlled provider/Wi-Fi interruption remains a separate
+  check; the timeout cluster in this capture does not count as controlled.
+
+PHASE 2 BOOT / EXTRACTION CONTENTION CAPTURE (2026-10-19)
+- The latest supplied capture begins with reset reason `Unknown (11)` and loads
+  15 structured facts at revision 148. The excerpt does not identify why that
+  reset occurred, so treat it as an unexplained boot-time reset code rather
+  than evidence of a stack crash. No panic is shown in the subsequent run.
+- The first two foreground turns succeeded. An extraction job was queued; the
+  deferred worker started at about 61.9 KB free heap and acquired the shared AI
+  network mutex. The next foreground turn began while that optional request was
+  in flight. It reached its AI request with only about 10.3 KB free and waited
+  for the shared mutex until extraction returned roughly 14.2 seconds later
+  with HTTP `-11`. Foreground then acquired the mutex. Later requests also
+  showed negative transport results while Wi-Fi remained connected; two
+  HTTP-200 responses were rejected at the low-heap parse guard. The capture
+  therefore shows foreground latency/contention and heap pressure, not a
+  demonstrated stack-overflow crash.
+- Stack high-water values are remaining unused stack, not bytes consumed. The
+  extraction worker reported 8,728 bytes remaining from its configured 12 KB
+  stack on the observed network-error path (about 3.6 KB used on that path).
+  This suggests its allocation can be trimmed, but does not establish peak use
+  during successful JSON parsing. The main loop reached about 776 bytes
+  remaining after worker startup, the tighter observed stack margin. The logs
+  do not identify a specific oversized local variable.
+- Source changes in response: require a 30-second gap since the last interaction
+  before extraction starts, and recheck that quiet gap after acquiring the
+  mutex so a newly arrived user turn closes the window before HTTP begins;
+  bound extraction connect/read waits to 3/7 seconds; and reduce the worker
+  stack reservation from 12 KB to 10 KB, saving 2 KB of heap while it exists.
+  A foreground turn arriving after extraction HTTP has begun can still wait for
+  that bounded call to finish; this is not preemptive cancellation.
+- Source-only changes: not compiled or flashed. On the next hardware run, verify
+  ordinary interaction resets the 30-second quiet window, extraction does not
+  acquire the mutex during active conversation/TTS, and a queued extraction
+  eventually completes after idle. Record worker and loop high-water after a
+  successful extraction parse before considering further stack reduction.
+  Recheck `-11` transport failures separately; connected Wi-Fi alone does not
+  prove that the remote endpoint or TLS stream was healthy.
+
+PHASE 2 POST-UPLOAD BOOT / SINGLE SMALL-TALK TURN (2026-10-19)
+- The supplied capture boots normally through display, filesystem, structured
+  memory, Wi-Fi, cloud restore, and TTS setup. It again reports reset reason
+  `Unknown (11)`; this excerpt does not establish the cause. Local structured
+  memory loads 15 facts and cloud revision 148 merges with no fact changes.
+- One foreground chat turn (`Hey Yuki, how's your evening going?`) completed
+  successfully on HTTP attempt 1/2: HTTP 200 in about 1.4 seconds, handled in
+  about 1.8 seconds, with free heap recovering to about 72.3 KB afterward. The
+  reply was displayed and spoken. The loop-task stack high-water at request
+  dispatch was 1,000 bytes. TTS completed; its worker reports 2,908 bytes of
+  high-water remaining (the exact configured TTS stack size is not established
+  by this excerpt). No panic or runtime failure appears.
+- This is evidence the flashed foreground path works with the two-attempt
+  retry configuration. It does not validate the extraction quiet-window or
+  reduced extraction-worker stack: there is no `Queued extraction`, deferred
+  worker start, mutex acquisition, or extraction result. The user's message is
+  small-talk/question content; `Personal turn eligible` is logged before
+  `requestMemoryExtract()` applies its filters, which can then discard it. Also,
+  the excerpt ends around 14 seconds after that user turn, before the new
+  30-second idle gate could expire. The next extraction check requires a real,
+  stable detail the user genuinely wants remembered, followed by at least 30
+  seconds without interaction and a capture long enough to include queue,
+  worker start, and result logs. Do not treat this small-talk run as an
+  extraction failure or as validation of the extraction fix.
+
+PHASE 2 FOLLOW-UP MULTI-MESSAGE MEMORY CHECK (2026-10-19)
+- The new capture confirms the two-attempt foreground build is running. Three
+  subsequent user turns completed on their first HTTP attempt (IDs 2-4, all
+  HTTP 200). Turn 2, `i like c++ programming`, was captured directly as an
+  explicit local fact (`User likes c++ programming`), raising structured memory
+  from 15 to 16 facts and syncing revision 149. Turn 3 repeated the existing
+  name; memory recognized it as a duplicate, kept 16 facts, and later synced
+  revision 150. Turn 4 asked for the name; memory search returned Maaz and Yuki
+  answered correctly. This validates explicit capture, duplicate recognition,
+  cloud sync, and recall in this sample.
+- None of these turns validates the background extractor. The C++ preference
+  was handled by explicit local capture, which suppresses fallback extraction;
+  the repeated name was a duplicate explicit capture; and `whats myname?` is a
+  memory query. There are no `Queued extraction`, `Deferred extraction worker
+  started`, or `Running extraction` logs. Do not infer worker success or failure
+  from this run. The 30-second idle window elapsed between turns, but there was
+  no queued job to process.
+- Foreground heap recovered to about 72-73 KB after turns 2-3. Turn 4's HTTP
+  response reached about 17.8 KB free / 7.7 KB largest block and still parsed
+  and completed successfully; the loop-task stack high-water was 952 bytes on
+  that turn. No panic appears. Continue treating low transient heap and the
+  relatively tight loop stack reserve as watch items.
+- Two unrelated idle-pulse attempts occurred around 299-308 seconds. One
+  provider request returned HTTP 400 for unparseable generated output; another
+  returned HTTP 200 with empty content. The idle scheduler skipped the failed
+  response / emitted an empty murmur action; neither event is an extraction
+  worker failure or a device crash. Track these separately if idle-pulse
+  reliability is in scope.
+- Next extraction validation must produce a queued fallback-extraction job:
+  use a truthful, stable detail that Yuki's explicit local fact parser does not
+  already capture, wait until all response/TTS activity ends, then allow at
+  least 30 seconds of quiet and capture through worker completion. Confirm the
+  queue, deferred worker start, `Running extraction`, HTTP result, and resulting
+  memory status. The current capture alone does not close that Phase 2 item.
+
+PHASE 2 FIRST QUEUED EXTRACTION DEVICE RUN (2026-10-19)
+- The user supplied a genuine stable statement not handled by the explicit fact
+  parser: `I usually plan my week on Sunday evenings`. Turn 5 succeeded with
+  foreground HTTP 200 on attempt 1/2 in about 1.95 seconds. It was queued for
+  fallback extraction at free heap about 27.7 KB; foreground completed and heap
+  recovered to about 72.3 KB. TTS finished at 535.6 seconds. The deferred worker
+  task was allocated at 535.6 seconds (heap about 63.7 KB), then honored the
+  full 30-second quiet interval and began the request at 555.5 seconds (queue
+  age about 31 seconds). This validates queue retention, deferred task startup,
+  and quiet-window scheduling.
+- Extraction acquired the shared AI mutex, but two observed HTTP attempts
+  returned `-11` after about 8.2 seconds each. The job remained queued for
+  retry 1/2 and then 2/2; the supplied excerpt ends before the next scheduled
+  attempt or final queue outcome, so do not mark it completed or discarded.
+  No foreground turn overlapped those network calls, hence this capture does
+  not measure actual user-visible wait from mutex contention. The bounded call
+  still occupies the mutex for about eight seconds if a foreground turn arrives
+  during extraction.
+- At extraction response, the 10,240-byte worker stack reported 6,680 bytes
+  remaining, around 3.6 KB used on this path. That is comfortable margin for
+  the observed transport-failure path and does not point to the worker stack as
+  the cause of `-11`. The main loop previously reported 952 bytes remaining on
+  foreground dispatch; keep watching that tighter reserve. Free heap fell to
+  about 12.5 KB during one extraction TLS call and recovered afterward; this is
+  transient heap pressure, not evidence of stack exhaustion. No panic appears.
+- Source review found the extraction request hardcoded `openai/gpt-oss-20b`,
+  while foreground chat sends `sys.currentModel`. The capture does not log the
+  selected model value, so the model mismatch is a likely contributor to the
+  repeated extraction timeout, not proven root cause. Updated extraction to
+  use the configured foreground model, capped output at 64 tokens for its short
+  classification tag, and added request model/payload/elapsed-time logs. The
+  read timeout remains bounded at 7 seconds to limit mutex occupancy. These
+  latest source edits have not been compiled or flashed; the capture predates
+  them. Next rebuild/upload, repeat one queued extraction, and check for a
+  successful HTTP response, parsed tag, queue removal, and unchanged fiction
+  safeguards. If it still returns `-11`, compare the new logged model and
+  elapsed time before changing timeouts or model selection again.
+
+PHASE 2 CONFIGURED-MODEL EXTRACTION RETEST AND CONNECTION-REFUSAL FIX (2026-10-19)
+- The latest uploaded build queued the Sunday-planning statement and completed
+  the foreground reply successfully (HTTP 200, about 2.3 seconds). The worker
+  started after TTS and the 30-second quiet gate, at queue age about 31 seconds.
+  This further validates deferred start and idle scheduling.
+- Extraction's new telemetry showed `model=openai/gpt-oss-20b`, payload 2,589
+  bytes, and three rapid failures: HTTPClient `-1` after 33 ms, 124 ms, and
+  50 ms. The third failure discarded the queue head; no extraction response
+  was received and the Sunday-planning fact was not added. This is distinct
+  from the earlier `-11` read-timeout failures. ESP32 Arduino HTTPClient defines
+  `-1` as `HTTPC_ERROR_CONNECTION_REFUSED`; the source header identifies the
+  mapping. The model-mismatch hypothesis from the prior entry is corrected:
+  `sys.currentModel` was the same `openai/gpt-oss-20b` value as the old hardcoded
+  extraction model, so model alignment did not change the actual model in this
+  test. The 64-token response cap was present but the request failed before a
+  model response.
+- Stack is not the cause shown here: extraction task high-water was 6,692 bytes
+  remaining from the 10 KB allocation. Free heap was about 57.6 KB when the
+  request started. The main loop stack high-water was 1,080 bytes on this turn.
+  No panic or crash is present.
+- Source changes in response: set `HTTPClient::setReuse(false)` for extraction,
+  matching foreground chat's fresh-connection policy, which already carries a
+  code comment tying it to connection-refused `-1` errors; and retain the queue
+  head after three retryable transport/server failures, applying a 60-second
+  cooldown before another retry cycle. Permanent non-retryable HTTP errors can
+  still remove a job. Changed the queue-removal log so it no longer calls an
+  error discard "completed". These changes are source-only, not compiled or
+  flashed. Rebuild/upload and repeat the same extraction check; expect the new
+  retryable-failure log to say the job is retained if all three attempts fail.
+
+PHASE 2 EXTRACTION SUCCESS AND POST-EXTRACTION PERSISTENCE GAP (2026-10-19)
+- The latest supplied build successfully executed the queued extraction. The
+  user turn was queued at 64.5 seconds, foreground HTTP returned 200 in about
+  1.9 seconds, and the reply/TTS completed. Deferred worker startup followed TTS;
+  extraction began at queue age about 31.4 seconds, confirming the quiet gate.
+  The request used `openai/gpt-oss-20b`, returned HTTP 200 in 1.7 seconds, and
+  produced `[MEM+: LOW: User usually plans their week on Sunday evenings]`.
+  Structured memory added it as slot 16 (17 active facts total), then removed
+  the queue job. This validates extraction request, classification, and queue
+  completion, and shows `setReuse(false)` working for this captured request.
+- Worker stack high-water remained 6,692 bytes from the 10 KB allocation, so
+  this successful path still shows about 3.5 KB used and ample worker margin.
+  Free heap fell to about 13.5 KB during TLS/response parsing, then recovered to
+  about 62.6 KB. No panic appears. The leading isolated pulse line says the
+  idle model call was skipped at a 64 KB heap sample; that is a protective gate,
+  not a crash.
+- Persistence is not demonstrated: after the new fact was added, the capture
+  contains neither `Saved structured memory (17 facts)` nor a cloud sync at the
+  new revision. The main loop's local-save and cloud-sync work both require at
+  least 64 KB free heap. With the idle extraction task still holding its 10 KB
+  stack, free heap remains around 62 KB, below that threshold. The new fact can
+  therefore remain RAM-only and be lost on reboot even though extraction and
+  queue removal succeeded.
+- Source fix: when the worker confirms the queue is empty, it now clears its
+  task handle under the queue mutex and deletes itself, releasing its stack so
+  deferred local save and cloud sync can pass the 64 KB gate. Enqueue now
+  snapshots the worker handle and updates the idle deadline under that same
+  mutex, avoiding a notify to an exiting worker. These edits are source-only,
+  not compiled or flashed. Rebuild/upload, repeat the same true statement, and
+  verify `Extraction queue empty; stopping worker to release stack`, then
+  `Saved structured memory (17 facts)` and `Structured memory sync` at the new
+  revision. Reboot afterward and confirm the fact is still loaded.
+
+PHASE 2 EXTRACTION RETEST: REPEATED CONNECTION REFUSAL AND DIAGNOSTIC BUILD (2026-10-19)
+- The latest serial capture boots normally, loads 16 structured facts at cloud revision 150, connects Wi-Fi, restores cloud state, and completes the greeting. The user turn “I usually plan my week on Sunday evenings” is handled as foreground turn 1: Wi-Fi is connected (RSSI about -57 dBm), HTTP returns 200 in 2.54 seconds, and the complete turn finishes in about 3.1 seconds. The reply and TTS complete without a crash.
+- Fallback extraction is queued after that turn and the worker starts only after TTS ends. It begins at queue age about 31 seconds, confirming the deferred startup and 30-second quiet-window behavior. The request uses `openai/gpt-oss-20b`, 2,606-byte payload, and about 57.4–58.0 KB free heap at request start.
+- This build repeatedly returns HTTPClient `-1` in only 32–155 ms across many retry cycles. Thus the 7-second timeout is not being reached, and aligning the configured model plus `setReuse(false)` did not resolve the transport failure on this run. Under ESP32 Arduino HTTPClient, `-1` means connection refused; it is a transport-level failure before a model response. Since foreground chat to the same service succeeds shortly beforehand, this points to a difference in the background client/request path or connection setup; the capture alone does not prove which cause. No response/tag is parsed, no fact is added, and the queued user fact remains in RAM for retries.
+- After the retry policy's three attempts, the queue head is retained and another cycle begins after a 60-second cooldown. Later in this long capture, Wi-Fi is unavailable and the worker keeps the job queued, checking every 5 seconds. The user fact was not durably extracted during this run.
+- Stack/heap evidence does not indicate stack overflow: extraction task high-water remains 6,692 bytes from its 10 KB stack (about 3.5 KB used); the foreground loop reported 1,000 bytes remaining at dispatch. There is no panic/backtrace. Free heap is around 57 KB at each extraction request and recovers near 60 KB on failed attempts. The boot line says reset reason `Unknown (11)`, but this capture has no evidence to attribute that reset to stack exhaustion or to this request.
+- The capture's request/status lines do not include the newly added `begin ready`, Wi-Fi/RSSI-at-begin, or TLS `lastError()` diagnostics, so this log came from firmware built before that latest diagnostic instrumentation. Source now logs whether `HTTPClient::begin()` succeeds and, on transport failure, the secure client's error code/text. These are diagnostic-only source edits; they have not been compiled or flashed, and the connection-refused root cause remains unresolved.
+- Worker self-deletion after the queue empties is still unvalidated: this capture never completes extraction, so the queue-empty/stack-release path is not reached. Consequently local persistence/cloud sync after successful extraction also remains unverified. Phase 2 is still in progress; the earlier successful extraction run validated classification/queue removal, but durable save after that result was not shown. The 30-turn and controlled Wi-Fi interruption checks are still outstanding.
+- Next: rebuild and upload the current source, keep Wi-Fi stable, send the same true user detail once, and capture from queue enqueue through at least the first extraction attempt. Look for `Extraction HTTP begin ready=1 ... wifi=3 rssi=...` and `Extraction HTTP status: -1 ... tls_err=...`. If the job fails, send those exact two lines plus surrounding Wi-Fi/network diagnostics; they should distinguish `begin()` setup failure from a lower-level TLS/socket failure. If a request succeeds, verify parsed `[MEM+: ...]`, queue removal, `Extraction queue empty; stopping worker to release stack`, local structured-memory save, cloud sync revision, and persistence after reboot. Do not treat the existing capture as verification of the latest diagnostics or worker self-deletion.
+
+PHASE 2 DIAGNOSTIC EXTRACTION RUN: SUCCESS, WORKER RELEASE, AND DURABLE MEMORY CONFIRMED (2026-10-19)
+- This newer capture includes the diagnostic build. At boot it loads 17 structured facts, including `LOW: User usually plans their week on Sunday evenings`; cloud revision 151 merges with 17 facts and later syncs revision 151. This confirms the fact from the earlier successful extraction survived into this boot, establishing persistence across that reboot.
+- Wi-Fi connects, cloud restore completes, and foreground chat turn 1 succeeds: RSSI stays around -54 to -59 dBm, foreground HTTP 200 takes about 2.34 seconds, and the whole turn completes in about 2.7 seconds. The same true detail is queued again, so the later extraction is a duplicate confirmation rather than a new distinct fact.
+- The new extraction diagnostics show `HTTP begin ready=1`, Wi-Fi connected (`wifi=3`) at RSSI about -55 dBm, and about 58 KB free heap. The first three attempts return HTTPClient `-11` after 8.2–8.5 seconds each; the secure client reports numeric error 51 but its text decoder says `UNKNOWN ERROR CODE (0033)`. This is consistent with the recurring read-timeout class observed previously, not the fast `-1` connection-refused class. The numeric TLS/client detail is not decoded well enough here to identify the underlying cause. The configured read timeout is 7 seconds, while the measured request time is 8.2–8.5 seconds including surrounding HTTP/TLS work. Model is `openai/gpt-oss-20b`; Wi-Fi remains connected with good RSSI, so this capture does not point to weak Wi-Fi or `HTTPClient::begin()` failure.
+- Retry retention works: after three failures the queue remains and enters the 60-second cooldown. A later attempt also times out; the next attempt succeeds with HTTP 200 in 2.43 seconds and `tls_err=0`. The extraction returns the expected `[MEM+: LOW: User usually plans their week on Sunday evenings]`. Memory reports `DUP ... count=2`, retains 17 facts, and removes the queue job. Therefore retry recovery and successful classification are validated, although transport reliability remains intermittent.
+- The worker-empty lifecycle fix is now demonstrated. Immediately after queue removal it logs `Extraction queue empty; stopping worker to release stack`. Free heap rises from about 13.7 KB at response processing to 59.6 KB after worker exit; local storage then logs `Saved structured memory (17 facts)`, and cloud sync advances to revision 152 with 17 facts. This validates worker stack release, local save, cloud sync, and reboot persistence of the fact (the reboot evidence is the next boot at revision 151, before this duplicate re-extraction; revision 152 itself was not followed by another reboot in this capture).
+- Stack data remains reassuring: extraction high-water is 6,604 bytes remaining from the 10 KB allocation. Foreground loop high-water is 1,000 bytes remaining at dispatch. The successful extraction has a transient low heap of about 13.7 KB during response handling, followed by worker exit and recovery. No panic/backtrace is present; do not attribute `Reset reason: Unknown (11)` to this run's stack or TLS without more evidence.
+- The long capture later contains separate idle-network failures: an idle pulse call returns `-11`, and memory consolidation at about 650 seconds gets foreground `-1` then `-1` after retry and displays “The connection failed before I could finish that reply.” Consolidation leaves the journal at 694 chars. These are separate API paths from the now-successful extraction and should remain on the broader network-reliability watch list. No crash is shown.
+- Phase 2 progress: background extraction, retry retention/recovery, queue completion, worker self-release, local save, cloud sync, and persistence across reboot are demonstrated. The immediate extraction failure root cause and intermittent foreground/idle transport failures remain unresolved; the 30-turn run and controlled Wi-Fi interruption/recovery check remain outstanding. Continue by testing foreground turns during/after extraction and capture whether requests are delayed or fail, then perform the planned controlled Wi-Fi interruption and recovery. Keep the TLS numeric error mapping as an open diagnostic item rather than guessing from code 51.
+
+PHASE 2 LONG IDLE REVIEW AND SELF-WAKE PROMPT TUNE (2026-10-19)
+- The supplied previous-build capture runs for about 39 minutes 31 seconds after boot. It loads 17 structured facts, including the Sunday-planning fact, and merges cloud revision 151. The pending extraction from the opening chat later succeeds after retries, removes a duplicate fact without increasing the active count, stops the empty worker, saves 17 facts, syncs revision 152, and the device continues running.
+- Idle pulse behavior mostly follows the quiet policy: provider read-timeout failures (`-11`) and one provider HTTP 400 are skipped; successful but ungrounded idle text (“I see that little flicker…”) is caught by the firmware guard and converted to a silent stare. A provider failure also produces a nonverbal stretch. No idle-pulse text is spoken in this excerpt.
+- The device enters its sleeping state after roughly 10 minutes without interaction, then self-wakes and speaks at about 21:20 uptime. It repeats the sleep/self-wake cycle and speaks again at about 38:08. These are expected under the current randomized sleep-duration behavior, but the generated self-wake lines do not meet the project's quiet/grounded standard: one asks “Did I miss something?” and another invents a blurry room, faint light, and a clock time. The idle grounding filter only covers pulse actions; self-wake uses a direct `syncAI()` prompt and bypasses that filter.
+- Source adjustment: tightened both automatic self-wake prompts (nap wake and deep-sleep wake) to request one brief, gentle line only about Yuki feeling sleepy and forbid questions or invented room/time/user details. This is a prompt-level change in `YUKI.ino`; it has not been compiled or flashed. It does not alter wake timing or user-triggered wake replies.
+- Stack observation: `loopTask stack high-water=392` appears on all three later AI turns (both self-wakes and intervening work), compared with 1,000 bytes on the first chat. No stack panic occurs in this capture, but 392 bytes is a small reported reserve and should be tracked in the next run. Do not treat the capture as proof of stack overflow or increase stack allocation without checking the board/core task configuration and a matching build.
+- Network behavior during idle remains imperfect: repeated pulse calls get `-11`, one gets HTTP 400 (`tool_choice` conflict), and memory consolidation later gets two `-1` failures; each path skips/retains work and the device continues. Consolidation leaves the journal at 694 chars and displays a connection-failure message while Yuki is asleep. This is a separate network/provider reliability issue from the corrected self-wake wording.
+- Next verification after rebuild/upload: leave Yuki idle for at least 25 minutes so one sleep/self-wake cycle occurs. Confirm any automatic spoken wake line is short, only describes her own sleepiness, and contains no question or invented environment/user detail. Capture loop-task high-water at dispatch and throughout the run, plus PULSE/network failures; confirm user-triggered wake still answers normally. This is an old firmware capture and does not validate the prompt edit or current unflashed source.
+
+PHASE 2 ACCEPTANCE TEST PREPARED (2026-10-19; NOT YET RUN)
+- The user has not flashed the latest source. Before evaluating any source prompt changes, compile and upload the current workspace version, reboot, and confirm the device reports `Test mode OFF`. Capture the full serial session from boot.
+- Run the 30-turn foreground test in normal mode, one message at a time. Wait for Yuki's complete reply/TTS before sending the next; keep the conversation flowing so the 10-minute idle sleep does not interfere. Use this non-fiction, ordinary-conversation script; only keep personal statements that are true for the user:
+  1. I've got a packed week and my thoughts are all over the place.
+  2. I don't need a whole plan yet; help me find one small first step.
+  3. Maybe I'll write down what absolutely has to happen.
+  4. Then I can choose just one thing for tonight.
+  5. That makes it feel more manageable.
+  6. When I get stuck, I sometimes take a short break.
+  7. What's a good way to make that break actually refreshing?
+  8. Walking away from the screen for a few minutes might help.
+  9. I also like hibiscus tea, so I could make a cup.
+  10. What makes a habit easier to keep going?
+  11. Would attaching it to an existing routine work?
+  12. For example, clearing my desk after dinner?
+  13. A couple of minutes seems realistic.
+  14. I tend to overestimate how much I can fit in.
+  15. How do I set a goal that's small without feeling pointless?
+  16. Maybe a twenty-minute work block is enough to begin.
+  17. What would you do if you lose focus halfway through?
+  18. I could note the distraction and return to it later.
+  19. That sounds practical.
+  20. I'm studying environmental science. How would you explain sustainability simply?
+  21. Can you give me an everyday example?
+  22. Reducing food waste makes sense.
+  23. How can I make that point without sounding preachy?
+  24. Ask people what's doable for them?
+  25. That feels kinder.
+  26. I also like fixing old cassette players.
+  27. The repairs are fiddly, but it feels good when one works.
+  28. How do you decide when to keep troubleshooting?
+  29. I should probably stop for tonight and pick it up with fresh eyes.
+  30. I'm done testing for now; we can just have a normal quiet moment.
+- Between every input, check for exactly one matching reply and completed request. Keep serial logs for `AI_TURN_DISPATCH`, `AI_REQ_BEGIN`, `AI_HTTP_BEGIN/END`, `AI_PARSE_BEGIN`, `AI_REQ_DONE`, retry/failure text, heap/largest-block readings, loop-task high-water, and any extraction queue activity. Acceptance is each of 30 inputs gets one completed answer or explicit failure within the chosen deadline; no stale/duplicate reply, skipped parse, watchdog/panic reset, or sustained heap decline.
+- Then test a controlled outage as a separate test. Keep USB serial attached. Submit one short message while service is connected; wait until its `AI_HTTP_BEGIN` line proves Yuki already received it, then briefly interrupt the router's Wi-Fi/internet. Leave the outage long enough for the bounded request/retry to reach its explicit failure (about 25-30 seconds maximum), restore connectivity, and confirm the same input is not answered a second time. Send one fresh message after reconnect and confirm exactly one normal reply with the next turn ID. Do not cut connectivity before the first test message reaches Yuki.
+- At the end, save the complete log, report any skipped turn IDs or replies, and note minimum free/largest heap and lowest loop-task high-water. Extraction and persistence were demonstrated in the prior capture; this run is the remaining Phase 2 foreground stress/interruption acceptance test. Do not call Phase 2 complete until this run passes. The 392-byte loop-task reserve from the previous idle capture remains a watch item.
+
+PHASE 2 ABORTED CHAT RUN: TLS ALLOCATION FAILURE AND FOREGROUND IMPACT (2026-10-19)
+- The user stopped the 30-turn run after six dispatched turns. Turn 1 completed normally (foreground HTTP 200 in 1.7 seconds) and queued a memory extraction. The extraction worker then failed its TLS setup/request with HTTPClient `-1` and `tls_err=-32512 'SSL - Memory allocation failed'` on repeated attempts. At extraction start total free heap was about 57.7 KB; Wi-Fi remained connected (`wifi=3`) around RSSI -49 dBm. This identifies an actual TLS allocation failure on the worker path; it is not evidence of a Wi-Fi outage.
+- Foreground turn IDs 2 through 6 then each failed both fast HTTP attempts with `-1`, and the firmware displayed its explicit connection-failure message. Wi-Fi remained connected with RSSI roughly -47 to -51 dBm. Turn ID 3 contains the same user prompt text as ID 2; the log alone cannot establish whether the user resent it after the failure or the app delivered it twice. The run is incomplete and fails the Phase 2 acceptance test. The user was right to stop rather than continue 30 messages through repeated failures.
+- At the start of these failures, the queue's background worker had retained its 10 KB task stack while waiting for retry. The logs do not prove that this alone caused the foreground TLS allocation failures, but it is an avoidable heap cost during retry waits and a plausible contributor alongside fragmentation. No panic or reset occurs in this short excerpt. Foreground loop high-water remains 1,000 bytes; the earlier idle-run 392-byte reading remains a separate watch item.
+- Source mitigation made after the capture: reduce the extraction worker stack from 10,240 to 8,192 bytes, leaving about 4.6 KB beyond the roughly 3.6 KB maximum observed use; when an extraction fails, retain the queue job but detach/delete the idle worker during its 30/60-second backoff, and let the main loop recreate it only after the backoff and normal 64 KB free-heap gate. Enqueue preserves any longer active retry deadline. This should restore worker-stack heap to foreground work while the job waits. This is evidence-based mitigation, not a claim that the root cause is fully fixed; the current TLS error and foreground request behavior require a new device capture.
+- These latest source edits have not been compiled or flashed. Next, rebuild/upload, then do a short 3-turn smoke check before attempting the full 30 turns. If extraction again logs `SSL - Memory allocation failed`, verify that it then logs the worker stopping/releasing its stack during backoff and that a subsequent foreground HTTP turn can still succeed. Do not run the 30-turn acceptance or controlled outage test until the short smoke check is stable. Preserve the complete serial capture including free/largest heap and turn IDs.
+
+PHASE 2 18-TURN CONVERSATION REVIEW AND WORKER IDLE-STACK FIX (2026-10-19)
+- The newly supplied log contains 18 dispatched foreground turns over about 6 minutes 37 seconds. Wi-Fi stays connected (`wifi=3`) at RSSI about -47 to -51 dBm throughout; no reboot, watchdog, or panic appears. Turns 1–7, 9–11, and 14–15 return parsed replies (12 successful replies total). Turns 8 and 16 are deliberately rejected at response parsing because free heap is only 7.3 KB / 5.7 KB and the largest free block is 2.5 KB. Turn 12 gets two HTTPClient `-11` read timeouts (about 11.4 seconds each); turn 13 gets an HTTP 200 after an extraction timeout, but ArduinoJson reports `IncompleteInput`; turns 17 and 18 fail after repeated `-1` connection errors and `-11` read timeouts respectively. The user repeats turn 17's prompt as turn 18; the capture cannot say whether this was a deliberate retry or a duplicate delivery.
+- The extraction queue reaches 8/8. One background extraction succeeds and recognizes the Sunday-planning detail as a duplicate of an existing fact; the fact count remains 17. The next extraction gets `-11` while a foreground turn is submitted, and the firmware logs `Retry job retained; stopping worker to release stack for 30000 ms`. This confirms the retry-path worker-release mitigation is present and runs in this firmware. It does not prevent an in-flight extraction from temporarily owning the shared network mutex when a new foreground message arrives. The failed foreground turn waits for that extraction to finish, then its response JSON is incomplete. The queue-empty self-delete path is not exercised because more jobs remain queued.
+- The two low-heap parse skips happen after the foreground TLS POST returns HTTP 200. The firmware's guard protects parsing under those conditions, so they are explicit failed replies rather than a crash. These measurements alone do not prove that the 8 KB worker stack caused them, but they occur after the extraction worker has started and while queued work remains. The heap recovers when requests/clients are cleaned up. The repeated `-11`/`-1` results happen with stable Wi-Fi and are a distinct transport/provider reliability problem; this capture does not identify their lower-level cause.
+- Source change in response: increase the extraction idle gap from 30 to 60 seconds, so a long foreground request does not consume most of the quiet period and immediately trigger background TLS work after it returns. If new foreground activity, TTS, or a response arrives while the worker is waiting for a safe window, the worker now clears its task handle under the queue mutex and deletes itself while retaining queued jobs. The main loop now also requires the full idle gap and no TTS before recreating it. This releases the worker's 8 KB stack during resumed conversation and avoids keeping it allocated through the rest of a long chat. The existing retry path already does this on a failed extraction. These source edits are not compiled or flashed; they cannot interrupt an extraction HTTP request already in progress.
+- Do not call the repeated HTTP timeouts fixed by the stack/idle changes. For next verification, build and upload current workspace source, then do three normal conversational turns and wait at least 60 seconds after the last turn for one queued extraction. Check that a fresh interaction during the idle wait logs `Foreground activity; queued job retained and worker stopped to release stack`; after the full quiet interval, check that the worker starts, drains work, and logs `Extraction queue empty; stopping worker to release stack`. Record free heap/largest block at each `AI_HTTP_END` and whether any `AI_PARSE_SKIP` or `IncompleteInput` occurs. Only proceed to the 30-turn acceptance run after this short check; if `-11` repeats with Wi-Fi healthy, keep it filed as upstream/socket transport behavior and report the exact per-attempt duration rather than attributing it to memory.
+
+PHASE 2 SHORT FOREGROUND SMOKE CAPTURE (2026-10-19; STABLE, NOT ACCEPTANCE)
+- The latest capture contains nine sequential foreground turns (`AI_TURN_DISPATCH` IDs 1–9). All nine complete with HTTP 200, `handled=1`, and one response each. There are no retry attempts, `AI_PARSE_SKIP`, `AI_PARSE_FAIL`, `IncompleteInput`, panic, or reset in the excerpt. RSSI stays roughly -46 to -51 dBm. Foreground `AI_HTTP_END` free heap ranges from about 20.2 KB to 27.9 KB, with smallest observed largest-free-block about 7.7 KB; after cleanup `AI_REQ_DONE` reports about 72–73 KB free. Loop-task high-water is 952 bytes on turns 2–9 (1,000 on turn 1), consistent across this short run. TTS reports 2,904 bytes worker stack high-water. This is good evidence that ordinary foreground replies and parsing are stable in this run, not proof that stress/outage cases are fixed.
+- The run queues five extraction candidates (queue reaches 5/8) but ends about seven seconds after turn 9; no extraction worker start, classifier result, queue drain, local save, or stack-release event appears. It therefore does not verify the new 60-second idle gate or worker-detach-on-resumed-chat path. It also contains only nine turns, not the planned 30, and no controlled network outage/recovery test. Phase 2 remains incomplete.
+- Conversation quality note: turns 1–6 are broadly relevant. Turn 6 offers a calming quote; the short follow-up `yes please` at turn 7 receives a reply containing an unrelated stock-market/EU-news item plus a quote. Turn 8's sneeze receives a soothing response, and turn 9 repeats a quote. These all parse and complete technically, so this is not a transport or heap failure, but the turn-7 context mismatch should be watched in a longer natural conversation. No change made from one example.
+- The excerpt also has three idle-pulse HTTP 200 calls whose content is empty/null and is silently ignored. The device stays responsive. Keep this as an idle-pulse/provider-quality observation; it does not count as a foreground turn failure.
+- Next: use the already-built/uploaded device for a focused idle-worker check. After a queued personal statement, leave it quiet for 60 seconds and capture whether extraction starts, succeeds or retries, removes the job, saves/syncs memory, and releases the worker stack when the queue empties. Then send one message during a later worker wait if convenient and verify the queued job is retained while the worker releases its stack. After that, perform the remaining 30-turn acceptance run and a separate controlled connectivity interruption/recovery run. Mark Phase 2 complete only after those acceptance checks pass; this nine-turn smoke alone is not enough.
+
+PHASE 2 FULL CHAT RUN REVIEW: FOREGROUND PASSES MOSTLY; MEMORY QUEUE/TLS STILL FAILS (2026-10-19)
+- The supplied capture spans about 13 minutes and records dispatch IDs 1–34. IDs 1–30 are the main test sequence with repeats after poor replies; IDs 31–34 include the closing prompts and repeated “quiet moment” messages. All foreground HTTP attempts shown return HTTP 200 on the first attempt, with Wi-Fi connected and RSSI roughly -36 to -52 dBm. There are no foreground HTTP transport failures, resets, watchdogs, or panics. Most scripted turns receive a normal, relevant reply; roughly 27/30 are useful on the first submission, consistent with the user's 90–95% estimate. The weaker turns recover only after a manual repeat: turn 3 returns an empty `[NEWS]` content and generic recovery line, then the same message at turn 4 gets a substantive answer; turn 25 fails JSON parsing with `IncompleteInput` and `handled=0`, then the repeated question at turn 26 gets a reply. Closing turns 32 and 33 also get generic “thoughts got tangled” fallbacks, while turn 34 receives a normal quiet response. Therefore the conversation is substantially working, with one confirmed parser failure and a few empty-model replies that still need improvement.
+- Foreground heap behavior is much better than the earlier 18-turn capture: after the first background worker is created, `AI_REQ_DONE` remains around 63–66 KB free through the rest of the run, without a downward trend. Foreground parsing starts with about 15.6–27.6 KB free; the smallest logged largest block at parse is about 5.1 KB. The loop-task high-water is 952–1,080 bytes across the conversational turns, versus 4,568 bytes remaining for the extraction worker. No heap-triggered foreground parse skip appears. The one `IncompleteInput` occurs with about 15.6 KB free, so it is not the earlier low-heap guard firing; it looks like an incomplete response/body parse, but this log cannot distinguish provider truncation from a stream/read issue.
+- The 60-second quiet gate is exercised: after the first five prompts and a quiet interval, the worker starts and processes the queued candidates. It returns `[MEM+: NONE]` for two candidates, so no new personal fact is recorded from those items. Two extraction calls time out (`-11`, TLS numeric error 51 undecoded as `UNKNOWN ERROR CODE (0033)`); each retains the job and logs that the worker stops to release its stack. This confirms backoff stack release is working. Later, after the chat, the worker starts with an 8-job queue whose oldest item is about 686 seconds old; at roughly 53 KB free its TLS setup fails with `SSL - Memory allocation failed` (`-1`, `tls_err=-32512`). The retry is retained and the worker releases its stack again. No successful `[MEM+: fact]`, queue drain, local memory save, or cloud revision change is shown in this capture. The queue is still 8/8 at the end.
+- Queue backpressure is a concrete remaining memory reliability problem: later user turns repeatedly log `Extraction queue full; rejected new job without discarding queued jobs` (11 rejections in the capture). Thus the foreground conversation works while the optional memory pipeline cannot keep up with a sustained personal conversation; newer extraction candidates can be lost, and the oldest queued jobs remain stale. This is distinct from the foreground chat transport, which is healthy in this run. The extraction TLS allocation failure at about 53 KB free also remains unresolved; stack release protects later foreground work but does not make extraction succeed.
+- Phase 2 status: the 30-turn foreground stress goal is substantially demonstrated, but it is not a clean pass under the existing acceptance criteria because turn 25 has an `IncompleteInput` parse failure and several turns need manual repeats after empty/generic content. Memory extraction reliability/persistence is not demonstrated and has concrete queue overflow plus TLS failure. The controlled connectivity interruption/recovery check also has not been run. Do not mark the overall Phase 2 complete yet. Next work should focus on reducing/coalescing extraction candidates or otherwise handling queue saturation without dropping recent facts, and diagnosing TLS allocation/timeout on the background path; then verify a successful extraction, queue drain, local save/cloud sync, and the controlled outage/recovery behavior. Keep the successful foreground run as evidence that the chat path is now much more stable.
+
+EXTRACTION-ONLY REDESIGN PLAN (2026-10-19; CONVERSATION PATH FROZEN)
+- Preserve the current conversational behavior and its observed 90–95% first-response rate. The extraction work must not change foreground chat prompts, conversation history construction, model selection, response parsing/routing, emotion or affinity handling, display/TTS, or foreground timeout/retry behavior. Make edits only to candidate selection, extraction queue representation, background batching/retry, and extraction diagnostics.
+- First narrow enqueue candidates to likely durable personal facts (identity/studies, lasting preferences, hobbies, recurring routines). Ordinary questions, transient moods, one-off plans, and conversational acknowledgements should not occupy extraction slots. Keep the existing fiction quarantine and memory deduplication/validation protections; the remote classifier still decides whether a candidate is `NONE` or a fact.
+- Then compact queued data and process several accepted candidates in a bounded batch after the existing quiet period. Avoid storing repeated full dialogue snapshots per turn where possible, but retain enough source/context to preserve fiction safeguards and attribute a saved fact to the correct user statement. Define a transparent overflow policy so full buffers do not silently reject the newest candidate; do not simply expand static RAM without measuring its cost.
+- Keep background work low priority and isolated from active chat. Retain the batch until its response is parsed and local changes are saved; on TLS/timeout/parse failure, keep it queued, release the worker stack, and retry only in a later safe idle window. Add extraction-start free/largest-block diagnostics so the `SSL - Memory allocation failed` case can be distinguished from a low contiguous block. Batching may reduce TLS frequency but is not assumed to cure the transport/allocation root cause.
+- Implement in small extraction-only steps. First validate with a short normal conversation plus a few genuinely stable user facts and at least one 60-second idle extraction window. Confirm foreground replies remain normal, candidate count stays bounded, extraction returns facts or `NONE`, retry retains work, successful work saves locally and syncs, and worker stack returns after the queue drains. Since the 30-turn foreground run already exists, do not rerun it unless a foreground file/path must change. Phase 2 still also needs the separate controlled connectivity interruption/recovery check before completion.
