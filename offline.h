@@ -180,7 +180,7 @@ static void offlinePulseAction() {
   int r = random(0, 100);
   // Pick a local action without any API call
   if (r < 50) {
-    // nothing — don't reset consecutiveNothingCount
+    LOGI("PULSE", "Offline idle presence: quiet");
     return;
   }
   consecutiveNothingCount = 0;
@@ -192,19 +192,24 @@ static void offlinePulseAction() {
     Emotion e = pool[random(0, 4)];
     currentEmotion = e; emotionSetTime = millis();
     { uint8_t vc = 1; switch(e) { case LOVE: vc=6; break; case SHY: vc=2; break; case CONFUSED: vc=2; break; case WINK: vc=3; break; default: vc=1; } emotionVariantIndex[(int)e] = (emotionVariantIndex[(int)e] + 1) % vc; }
+    LOGI("PULSE", "Offline idle presence: local expression=%d", (int)e);
   } else if (r < 80) {
     if (sys.soundOn) sound_hum();
+    LOGI("PULSE", "Offline idle presence: hum");
   } else if (r < 90) {
     strncpy(aiMsg, "*sigh*", sizeof(aiMsg) - 1);
     aiMsg[sizeof(aiMsg) - 1] = '\0';
     scrollOffset = 0;
     if (sys.soundOn) sound_sleepy();
+    LOGI("PULSE", "Offline idle presence: sigh");
   } else if (r < 95) {
     currentEmotion = SHY; emotionSetTime = millis();
     emotionVariantIndex[(int)SHY] = (emotionVariantIndex[(int)SHY] + 1) % 2;
+    LOGI("PULSE", "Offline idle presence: shy expression");
   } else {
     currentEmotion = THINKING_FACE; emotionSetTime = millis();
     emotionVariantIndex[(int)THINKING_FACE] = (emotionVariantIndex[(int)THINKING_FACE] + 1) % 2;
     silentThoughtUntil = millis() + 4000;
+    LOGI("PULSE", "Offline idle presence: quiet thought");
   }
 }

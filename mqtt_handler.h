@@ -195,7 +195,7 @@ inline bool syncMemoryToCloud() {
   return false;
 }
 
-void saveSys();
+bool saveSys();
 void sendMessage(const char* recipientID, const char* message);
 void sendMessageNoHistory(const char* recipientID, const char* message);
 bool geocodeLocation(const char* cityName);
@@ -313,7 +313,13 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     // Numeric fields: always safe to update from cloud
     if (strcmp(key, "rpgHP") == 0) rpgHP = atoi(message);
     else if (strcmp(key, "rpgGold") == 0) rpgGold = atoi(message);
-    else if (strcmp(key, "aff") == 0) sys.affinity = atoi(message);
+    else if (strcmp(key, "aff") == 0) {
+      int oldAffinity = sys.affinity;
+      sys.affinity = constrain(atoi(message), -100, 100);
+      if (sys.affinity != oldAffinity)
+        LOGI("AFF", "source=cloud old=%d delta=%d new=%d",
+             oldAffinity, sys.affinity - oldAffinity, sys.affinity);
+    }
     else if (strcmp(key, "xp") == 0)    { sys.xp    = atoi(message); pendingSysSave = true; }
     else if (strcmp(key, "level") == 0) { sys.level  = atoi(message); pendingSysSave = true; }
     else if (strcmp(key, "tz") == 0)    { sys.timeZoneOffset = atol(message); pendingSysSave = true; }

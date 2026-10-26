@@ -78,11 +78,15 @@ SemaphoreHandle_t memoryWorkMutex = NULL;  // Prevents extraction TLS from overl
 // lower than the pre-start threshold so it does not wait on memory it reserved.
 #define MEM_EXTRACT_WORKER_MIN_HEAP 56000
 #define MEM_EXTRACT_IDLE_GAP_MS 60000UL
-static char memExtractQueue[MEM_EXTRACT_QUEUE_SIZE][1152] = {};
+#define MEM_EXTRACT_ITEM_LEN 256
+#define MEM_EXTRACT_BATCH_SIZE 2
+static char memExtractQueue[MEM_EXTRACT_QUEUE_SIZE][MEM_EXTRACT_ITEM_LEN] = {};
+static uint32_t memExtractQueueId[MEM_EXTRACT_QUEUE_SIZE] = {};
 static uint32_t memExtractQueueEnqueuedAt[MEM_EXTRACT_QUEUE_SIZE] = {};
 static uint8_t memExtractQueueHead = 0;
 static uint8_t memExtractQueueTail = 0;
 static uint8_t memExtractQueueCount = 0;
+static uint32_t memExtractNextId = 1;
 static volatile uint32_t memExtractNotBefore = 0;
 extern volatile bool ttsPlaying;
 extern volatile bool ttsPendingSpeak;
@@ -145,6 +149,8 @@ int rpgGold = 0; extern char rpgStory[256];
 // --- MESSAGE STORAGE ---
 Message receivedMessages[MAX_MESSAGES];
 int messageIndex = 0;
+bool sleepConversationBoundaryActive = false;
+uint8_t sleepConversationEntriesSinceBoundary = 0;
 
 // --- PRESENCE DETECTION ---
 IPAddress phoneIP;
@@ -218,7 +224,8 @@ unsigned long pendingReturnAbsenceHours = 0;
 void enterYukiSleep();
 void wakeYukiSleep();
 void exitGroggy();
-void syncAI(const char* prompt, bool isPersonal, Mode returnMode, bool bypassCooldown, bool speak);
+void syncAI(const char* prompt, bool isPersonal, Mode returnMode, bool bypassCooldown, bool speak,
+            bool freshWakeContext, const char* historyUserText);
 
 bool setConversationTestMode(bool enabled) {
   if (enabled == conversationTestMode) return true;
@@ -284,6 +291,7 @@ void heavyOpCooldown() {
 // Forward declarations for functions defined in trailing headers
 void drawAesthetica();
 void safeDelay(int ms);
+static size_t aiLargestFreeBlock();
 
 bool canAllocJson(size_t sz) {
   // ESP32 heap is not fragmented like ESP8266; use getFreeHeap() directly.
@@ -297,33 +305,123 @@ bool canAllocJson(size_t sz) {
 #define MEM_EXTRACT_TASK_STACK 8192
 #define MEM_EXTRACT_TASK_PRIO   1
 
+static void memExtractNormalizeCandidate(const char* src, char* dst, size_t dstSize) {
+  if (!dst || dstSize == 0) return;
+  size_t used = 0;
+  bool pendingSpace = false;
+  if (src) {
+    while (*src && used + 1 < dstSize) {
+      unsigned char c = (unsigned char)*src++;
+      if (isspace(c)) { pendingSpace = used > 0; continue; }
+      if (pendingSpace && used + 1 < dstSize) dst[used++] = ' ';
+      pendingSpace = false;
+      dst[used++] = (char)tolower(c);
+    }
+  }
+  dst[used] = '\0';
+}
+
+static bool memExtractAckBatch(const uint32_t* ids, const bool* completed, uint8_t count) {
+  if (!memExtractMutex || xSemaphoreTake(memExtractMutex, pdMS_TO_TICKS(1000)) != pdTRUE)
+    return false;
+  uint8_t originalCount = memExtractQueueCount;
+  uint8_t kept = 0;
+  uint8_t acknowledged = 0;
+  for (uint8_t read = 0; read < originalCount; read++) {
+    uint8_t slot = (memExtractQueueTail + read) % MEM_EXTRACT_QUEUE_SIZE;
+    bool remove = false;
+    for (uint8_t j = 0; j < count; j++) {
+      if (completed[j] && memExtractQueueId[slot] == ids[j]) { remove = true; break; }
+    }
+    if (remove) {
+      acknowledged++;
+      LOGI("MEM", "Extraction item acknowledged id=%lu", (unsigned long)memExtractQueueId[slot]);
+    } else {
+      uint8_t writeSlot = (memExtractQueueTail + kept) % MEM_EXTRACT_QUEUE_SIZE;
+      if (writeSlot != slot) {
+        memmove(memExtractQueue[writeSlot], memExtractQueue[slot], sizeof(memExtractQueue[slot]));
+        memExtractQueueId[writeSlot] = memExtractQueueId[slot];
+        memExtractQueueEnqueuedAt[writeSlot] = memExtractQueueEnqueuedAt[slot];
+      }
+      kept++;
+    }
+  }
+  for (uint8_t clear = kept; clear < originalCount; clear++) {
+    uint8_t slot = (memExtractQueueTail + clear) % MEM_EXTRACT_QUEUE_SIZE;
+    memExtractQueue[slot][0] = '\0';
+    memExtractQueueId[slot] = 0;
+    memExtractQueueEnqueuedAt[slot] = 0;
+  }
+  memExtractQueueCount = kept;
+  memExtractQueueHead = (memExtractQueueTail + kept) % MEM_EXTRACT_QUEUE_SIZE;
+  xSemaphoreGive(memExtractMutex);
+  return acknowledged > 0;
+}
+
+static bool memExtractPersistFact(const char* fact) {
+  if (!memoryV2HasFact(fact)) memoryV2ObserveFact(fact);
+  if (!memoryV2HasFact(fact)) {
+    if (memoryV2FactWouldBeRejected(fact)) {
+      LOGW("MEM", "Extraction result explicitly declined by memory priority/capacity policy; item completed without save: %.64s", fact);
+      return true;
+    }
+    LOGW("MEM", "Fact not admitted to structured memory; extraction item retained: %.64s", fact);
+    return false;
+  }
+  if (!memoryV2Save()) {
+    LOGW("MEM", "Structured memory save failed; extraction item retained: %.64s", fact);
+    return false;
+  }
+  pendingCloudSync = true;
+  if (memExtractMutex && xSemaphoreTake(memExtractMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+    if (!strstr(core_chatSummary, fact)) {
+      int curLen = strlen(core_chatSummary);
+      if (curLen + strlen(fact) + 3 < 1023) {
+        if (curLen > 0) strncat(core_chatSummary, " | ", 1023 - curLen - 1);
+        strncat(core_chatSummary, fact, 1023 - strlen(core_chatSummary) - 1);
+        if (!saveCoreMemory()) pendingMemorySave = true;
+      } else {
+        LOGW("MEM", "Legacy journal full; structured fact persisted");
+      }
+    }
+    xSemaphoreGive(memExtractMutex);
+  } else {
+    LOGW("MEM", "Legacy journal update deferred; structured fact persisted");
+  }
+  LOGI("MEM", "Extraction fact persisted locally and queued for cloud sync: %.70s", fact);
+  return true;
+}
+
 static void memExtractWorker(void *arg) {
   (void)arg;
-  static char retryingJob[1152] = "";
-  static uint8_t jobRetryCount = 0;
   for (;;) {
     ulTaskNotifyTake(pdFALSE, portMAX_DELAY);
     if (conversationTestMode || memoryFictionQuarantined || memoryFictionBoundaryPending) {
       ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(5000));
       continue;
     }
-    static char jobMsg[1152] = "";
-    uint32_t jobEnqueuedAt = 0;
-    jobMsg[0] = '\0';
+    static char jobMsg[MEM_EXTRACT_BATCH_SIZE][MEM_EXTRACT_ITEM_LEN] = {};
+    uint32_t jobIds[MEM_EXTRACT_BATCH_SIZE] = {};
+    uint32_t jobEnqueuedAt[MEM_EXTRACT_BATCH_SIZE] = {};
+    uint8_t batchCount = 0;
     if (!memExtractMutex || xSemaphoreTake(memExtractMutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
       LOGW("MEM", "Queue mutex timeout");
       vTaskDelay(pdMS_TO_TICKS(1000));
       xTaskNotifyGive(memExtractTaskHandle);
       continue;
     }
-    if (memExtractQueueCount > 0) {
-      strncpy(jobMsg, memExtractQueue[memExtractQueueTail], sizeof(jobMsg) - 1);
-      jobMsg[sizeof(jobMsg) - 1] = '\0';
-      jobEnqueuedAt = memExtractQueueEnqueuedAt[memExtractQueueTail];
+    while (batchCount < MEM_EXTRACT_BATCH_SIZE && batchCount < memExtractQueueCount) {
+      uint8_t slot = (memExtractQueueTail + batchCount) % MEM_EXTRACT_QUEUE_SIZE;
+      strncpy(jobMsg[batchCount], memExtractQueue[slot], sizeof(jobMsg[batchCount]) - 1);
+      jobMsg[batchCount][sizeof(jobMsg[batchCount]) - 1] = '\0';
+      jobIds[batchCount] = memExtractQueueId[slot];
+      jobEnqueuedAt[batchCount] = memExtractQueueEnqueuedAt[slot];
+      if (!jobMsg[batchCount][0]) break;
+      batchCount++;
     }
     xSemaphoreGive(memExtractMutex);
 
-    if (strlen(jobMsg) == 0) continue;
+    if (batchCount == 0) continue;
     if (WiFi.status() != WL_CONNECTED) {
       LOGW("MEM", "Extraction held in queue: no WiFi");
       vTaskDelay(pdMS_TO_TICKS(5000));
@@ -398,31 +496,30 @@ static void memExtractWorker(void *arg) {
     }
 
     heavyOpCooldown();
-    LOGI("MEM","Running extraction for: %.40s (heap=%u queue=%u oldest_age_ms=%lu)",
-         jobMsg, ESP.getFreeHeap(), memExtractQueueCount,
-         (unsigned long)(millis() - jobEnqueuedAt));
+    LOGI("MEM","Running extraction batch=%u (heap=%u queue=%u oldest_age_ms=%lu largest=%u)",
+         batchCount, ESP.getFreeHeap(), memExtractQueueCount,
+         (unsigned long)(millis() - jobEnqueuedAt[0]), (unsigned)aiLargestFreeBlock());
 
     char authHeader[128];
     snprintf(authHeader, sizeof(authHeader), "Bearer %s", API_KEY);
 
-    static char extractPrompt[2304];
-    snprintf(extractPrompt, sizeof(extractPrompt),
-      "Classify a personal detail from the CURRENT USER MESSAGE only. Recent dialogue is context only for fiction, referents, and corrections. "
-      "Use recent conversation only to tell whether the message is fictional/roleplay, who a detail refers to, or whether it corrects an earlier statement. "
-      "Never save facts about a fictional character or hypothetical scenario as facts about the real user. "
-      "If the detail is fictional, quoted, about someone else, or its referent is unclear, output NONE. "
-      "Do not save one-off completed events such as a single class, presentation, errand, purchase, or meal unless the user explicitly says it is recurring, ongoing, or important to remember. "
-      "Output exactly one tag: [MEM+: h: fact], [MEM+: LOW: fact], [MEM?: h: fact], [MEM?: LOW: fact], or [MEM+: NONE]. "
-      "Use MEM+ only for a clear, explicit, lasting fact, preference, ongoing context, or correction that should be remembered without asking. "
-      "Use MEM? only when the detail seems potentially useful but the user has not made clear that it is lasting or worth retaining; it will be held temporarily and Yuki will ask permission. "
-      "Prefer NONE over MEM? when the detail is trivial, fleeting, or unlikely to help later. "
-      "Use h for identity or an explicit stable preference. Use LOW for a stable interest, habit, or ongoing context. "
-      "Use NONE for temporary moods, passing remarks, one-time plans, questions, greetings, fictional content, or details that are not useful later. "
-      "Write a concise, self-contained fact about the user (for example, 'h: User studies computer science'). "
-      "Do not repeat the user's first-person wording after adding 'User ...'. Never infer a preference from one casual mention, invent details, or output the placeholder word 'fact'. "
-      "Never turn an assistant statement or a character's detail into a user fact. "
-      "Input: %s",
-      jobMsg);
+    static char extractPrompt[1800];
+    int promptUsed = snprintf(extractPrompt, sizeof(extractPrompt),
+      "Classify each CURRENT USER MESSAGE independently. Ignore other candidates as context. "
+      "Never save fictional, quoted, hypothetical, or other people's details as user facts. "
+      "Do not save one-off completed events unless explicitly recurring, ongoing, or important to remember. "
+      "Only clear explicit lasting facts/preferences/ongoing context get MEM+. Use NONE for questions, greetings, transient moods, one-time plans, fiction, uncertain referents, or low-value details. "
+      "Use h for identity or an explicit stable preference; use LOW for stable interests, habits, or ongoing context. "
+      "Facts must be concise and self-contained, about the user, without invented detail. "
+      "For potentially useful but uncertain details use MEM? so Yuki can ask permission. Return exactly one line per input, in the same order: ID=<id> [MEM+: h: fact], ID=<id> [MEM+: LOW: fact], ID=<id> [MEM?: h: fact], ID=<id> [MEM?: LOW: fact], or ID=<id> [MEM+: NONE]. No extra text.\n");
+    for (uint8_t i = 0; i < batchCount && promptUsed > 0 &&
+         (size_t)promptUsed < sizeof(extractPrompt) - 8; i++) {
+      int wrote = snprintf(extractPrompt + promptUsed, sizeof(extractPrompt) - promptUsed,
+                           "ID=%lu USER_MESSAGE: %.220s\n",
+                           (unsigned long)jobIds[i], jobMsg[i]);
+      if (wrote <= 0 || (size_t)wrote >= sizeof(extractPrompt) - promptUsed) break;
+      promptUsed += wrote;
+    }
 
     static StaticJsonDocument<4096> doc;
     static char body[4096];
@@ -431,11 +528,11 @@ static void memExtractWorker(void *arg) {
     doc["model"] = sys.currentModel;
     doc["temperature"] = 0.1;
     doc["reasoning_effort"] = "low";
-    doc["max_tokens"] = 64;
+    doc["max_tokens"] = 160;
     JsonArray messages = doc.createNestedArray("messages");
     JsonObject sysMsg = messages.createNestedObject();
     sysMsg["role"] = "system";
-    sysMsg["content"] = "Classify only the CURRENT USER MESSAGE; recent conversation is context for fiction, referents, and corrections. Never save fictional, quoted, or other people's facts about the user. MEM+ is only for clear explicit lasting facts; MEM? is for potentially useful but ambiguous durability and requires user confirmation; NONE for temporary, trivial, fictional, or uncertain referents. Output exactly one of [MEM+: h: fact], [MEM+: LOW: fact], [MEM?: h: fact], [MEM?: LOW: fact], [MEM+: NONE].";
+    sysMsg["content"] = "Return exactly one ID-tagged result per input line. Use [MEM+: h: fact], [MEM+: LOW: fact], [MEM?: h: fact], [MEM?: LOW: fact], or [MEM+: NONE]. Never infer, use fiction, or return facts about anyone except the user.";
     JsonObject userMsg = messages.createNestedObject();
     userMsg["role"] = "user";
     userMsg["content"] = extractPrompt;
@@ -482,6 +579,8 @@ static void memExtractWorker(void *arg) {
       continue;
     }
 
+    LOGI("MEM", "Pre-HTTP extraction heap=%u largest=%u batch=%u payload=%u",
+         ESP.getFreeHeap(), (unsigned)aiLargestFreeBlock(), batchCount, (unsigned)bodyLength);
     bool httpReady = http.begin(extractClient, "https://api.groq.com/openai/v1/chat/completions");
     http.setTimeout(7000);
     http.setConnectTimeout(3000);
@@ -491,9 +590,9 @@ static void memExtractWorker(void *arg) {
     http.addHeader("Content-Type", "application/json");
     http.addHeader("Authorization", authHeader);
     uint32_t extractionStartedAt = millis();
-    LOGI("MEM", "Extraction HTTP begin ready=%d model=%s timeout=7000ms payload=%u wifi=%d rssi=%d heap=%u",
-         httpReady, sys.currentModel, (unsigned)bodyLength, (int)WiFi.status(),
-         WiFi.RSSI(), ESP.getFreeHeap());
+    LOGI("MEM", "Extraction HTTP ready=%d model=%s timeout=7000ms wifi=%d rssi=%d heap=%u largest=%u",
+         httpReady, sys.currentModel, (int)WiFi.status(),
+         WiFi.RSSI(), ESP.getFreeHeap(), (unsigned)aiLargestFreeBlock());
     int httpCode = httpReady ? http.POST((uint8_t*)body, bodyLength) : -1;
     char tlsError[96] = {};
     int tlsErrorCode = 0;
@@ -515,195 +614,123 @@ static void memExtractWorker(void *arg) {
       ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(5000));
       continue;
     }
+    bool completed[MEM_EXTRACT_BATCH_SIZE] = {};
+    bool responseParsed = false;
     if (httpCode > 0 && httpCode == 200) {
-      static StaticJsonDocument<200> responseFilter;
-      static StaticJsonDocument<512> respDoc;
+      static StaticJsonDocument<256> responseFilter;
+      static StaticJsonDocument<2048> respDoc;
       responseFilter.clear();
       responseFilter["choices"][0]["message"]["content"] = true;
       responseFilter["choices"][0]["message"]["reasoning_content"] = true;
       responseFilter["choices"][0]["text"] = true;
-      responseFilter["error"]["message"] = true;
       respDoc.clear();
       Stream& responseStream = http.getStream();
       DeserializationError jsonErr =
           deserializeJson(respDoc, responseStream, DeserializationOption::Filter(responseFilter));
       if (jsonErr) {
-        LOGW("MEM","JSON stream parse error: %s", jsonErr.c_str());
+        LOGW("MEM", "Batch JSON parse error: %s", jsonErr.c_str());
       } else {
         const char* content = respDoc["choices"][0]["message"]["content"];
-        if (!content || strlen(content) == 0) {
-          content = respDoc["choices"][0]["message"]["reasoning_content"] | "";
-          if (!content || strlen(content) == 0) content = respDoc["choices"][0]["text"] | "";
-        }
-        LOGI("MEM","Extraction raw: '%s' (model=%s)", content ? content : "(null)", sys.currentModel);
-        if (content && strlen(content) > 0) {
-          if (strstr(content, "NONE")) {
-            LOGI("MEM","Extraction returned NONE for: %.40s", jobMsg);
-          }
-          const char* candidateTag = strstr(content, "[MEM?:");
-          const char* tag = candidateTag ? candidateTag : strstr(content, "[MEM+:");
-          if (tag) {
-            const char* start = tag + 6;
-            const char* end = strchr(start, ']');
-            // Guard: reject if another tag's bracket leaked in (malformed tag)
-            if (end && memchr(start, '[', end - start) != NULL) end = NULL;
-            if (end && (end - start) > 4) {
-              int factLen = end - start;
-              if (factLen < MEMORY_V2_FACT_LEN) {
+        if (!content || !content[0]) content = respDoc["choices"][0]["message"]["reasoning_content"] | "";
+        if (!content || !content[0]) content = respDoc["choices"][0]["text"] | "";
+        static char resultText[1500];
+        strncpy(resultText, content ? content : "", sizeof(resultText) - 1);
+        resultText[sizeof(resultText) - 1] = '\0';
+        LOGI("MEM", "Batch result: '%s'", resultText);
+        responseParsed = resultText[0] != '\0';
+        char* line = resultText;
+        while (line && *line) {
+          char* nextLine = strchr(line, '\n');
+          if (nextLine) *nextLine++ = '\0';
+          while (*line == ' ' || *line == '\t' || *line == '\r') line++;
+          if (strncmp(line, "ID=", 3) == 0) {
+            char* idEnd = nullptr;
+            unsigned long parsedId = strtoul(line + 3, &idEnd, 10);
+            while (idEnd && (*idEnd == ' ' || *idEnd == '\t' || *idEnd == ':')) idEnd++;
+            int jobIndex = -1;
+            for (uint8_t i = 0; i < batchCount; i++)
+              if (jobIds[i] == (uint32_t)parsedId) { jobIndex = i; break; }
+            if (jobIndex >= 0 && !completed[jobIndex] && idEnd && *idEnd == '[') {
+              bool isQuestionTag = strncmp(idEnd, "[MEM?:", 6) == 0;
+              bool isFactTag = strncmp(idEnd, "[MEM+:", 6) == 0;
+              const char* start = idEnd + 6;
+              const char* end = strchr(start, ']');
+              if ((isFactTag || isQuestionTag) && end && !memchr(start, '[', end - start) &&
+                  end > start && (size_t)(end - start) < MEMORY_V2_FACT_LEN) {
                 char fact[MEMORY_V2_FACT_LEN];
-                strncpy(fact, start, factLen);
-                fact[factLen] = '\0';
+                memcpy(fact, start, end - start);
+                fact[end - start] = '\0';
                 char* factStart = fact;
                 while (*factStart == ' ' || *factStart == '\t') factStart++;
                 if (factStart != fact) memmove(fact, factStart, strlen(factStart) + 1);
-                bool isNone = (strcmp(fact, "NONE") == 0);
-                bool hasValidKind = strncmp(fact, "h: ", 3) == 0 || strncmp(fact, "LOW: ", 5) == 0;
-                bool isValid = !isNone && hasValidKind && memoryV2UsableText(fact);
-                if (candidateTag && isValid) {
-                  bool candidateStored = false;
-                  bool candidateOccupied = false;
-                  portENTER_CRITICAL(&pendingDurableMemoryCandidateMux);
-                  if (pendingDurableMemoryCandidate[0] &&
-                      (uint32_t)(millis() - pendingDurableMemoryCandidateAt) >= 30UL * 60UL * 1000UL) {
-                    pendingDurableMemoryCandidate[0] = '\0';
-                    pendingDurableMemoryConfirmationAsked = false;
-                  }
-                  if (!pendingDurableMemoryCandidate[0]) {
-                    strncpy(pendingDurableMemoryCandidate, fact, sizeof(pendingDurableMemoryCandidate) - 1);
-                    pendingDurableMemoryCandidate[sizeof(pendingDurableMemoryCandidate) - 1] = '\0';
-                    pendingDurableMemoryCandidateAt = millis();
-                    pendingDurableMemoryConfirmationAsked = false;
-                    candidateStored = true;
-                  } else {
-                    candidateOccupied = true;
-                  }
-                  portEXIT_CRITICAL(&pendingDurableMemoryCandidateMux);
-                  if (candidateStored) LOGI("MEM", "Confirmation candidate queued (RAM only): %.70s", fact);
-                  else if (candidateOccupied) LOGI("MEM", "Confirmation candidate not queued: one is already pending");
-                } else if (isValid) {
-                  memoryV2ObserveFact(fact);
-                  if (xSemaphoreTake(memExtractMutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
-                    pendingCloudSync = true;
-                    if (!strstr(core_chatSummary, fact)) {
-                      int curLen = strlen(core_chatSummary);
-                      if (curLen + strlen(fact) + 3 < 1023) {
-                        if (curLen > 0) strncat(core_chatSummary, " | ", 1023 - curLen - 1);
-                        strncat(core_chatSummary, fact, 1023 - strlen(core_chatSummary) - 1);
-                        saveCoreMemory();
-                        LOGI("MEM","LLM extracted: %s", fact);
-                      } else {
-                        LOGW("MEM", "Legacy memory journal full; structured fact still queued for save");
-                      }
+                if (isFactTag && strcmp(fact, "NONE") == 0) {
+                  completed[jobIndex] = true;
+                  LOGI("MEM", "Extraction returned NONE id=%lu", (unsigned long)parsedId);
+                } else if ((strncmp(fact, "h: ", 3) == 0 || strncmp(fact, "LOW: ", 5) == 0) &&
+                           memoryV2UsableText(fact)) {
+                  if (isQuestionTag) {
+                    bool stored = false;
+                    portENTER_CRITICAL(&pendingDurableMemoryCandidateMux);
+                    if (pendingDurableMemoryCandidate[0] &&
+                        (uint32_t)(millis() - pendingDurableMemoryCandidateAt) >= 30UL * 60UL * 1000UL) {
+                      pendingDurableMemoryCandidate[0] = '\0';
+                      pendingDurableMemoryConfirmationAsked = false;
                     }
-                    xSemaphoreGive(memExtractMutex);
+                    if (!pendingDurableMemoryCandidate[0] ||
+                        strcmp(pendingDurableMemoryCandidate, fact) == 0) {
+                      strncpy(pendingDurableMemoryCandidate, fact, sizeof(pendingDurableMemoryCandidate) - 1);
+                      pendingDurableMemoryCandidate[sizeof(pendingDurableMemoryCandidate) - 1] = '\0';
+                      pendingDurableMemoryCandidateAt = millis();
+                      pendingDurableMemoryConfirmationAsked = false;
+                      stored = true;
+                    }
+                    portEXIT_CRITICAL(&pendingDurableMemoryCandidateMux);
+                    completed[jobIndex] = stored;
+                    LOGI("MEM", "Uncertain candidate %s id=%lu", stored ? "held for confirmation" : "retained; another confirmation is pending", (unsigned long)parsedId);
                   } else {
-                    LOGW("MEM","Extract mutex timeout after structured fact update");
+                    completed[jobIndex] = memExtractPersistFact(fact);
                   }
-                } else if (!isNone) {
-                  LOGW("MEM", "Extraction rejected malformed/invalid fact tag");
+                } else {
+                  LOGW("MEM", "Malformed batch result retained id=%lu", (unsigned long)parsedId);
                 }
               }
             }
-          } else {
-            LOGI("MEM","No memory tag in extraction response: %.60s", content);
           }
+          line = nextLine;
         }
       }
     } else {
-      LOGW("MEM","Extract API failed: %d", httpCode);
+      LOGW("MEM", "Batch extraction API failed: %d", httpCode);
     }
-    bool retryableFailure = httpCode <= 0 || httpCode == 408 ||
-                            httpCode == 429 || httpCode >= 500;
-    bool retryJob = false;
-    uint32_t retryDelayMs = 30000UL;
-    if (retryableFailure) {
-      if (strcmp(retryingJob, jobMsg) != 0) {
-        strncpy(retryingJob, jobMsg, sizeof(retryingJob) - 1);
-        retryingJob[sizeof(retryingJob) - 1] = '\0';
-        jobRetryCount = 0;
-      }
-      retryJob = true;
-      if (jobRetryCount < 2) {
-        jobRetryCount++;
-        LOGW("MEM", "Extraction job retained for retry %u/2 (HTTP=%d)",
-             jobRetryCount, httpCode);
-      } else {
-        // Keep the FIFO head through a full failed retry cycle. Back off before
-        // starting another cycle instead of silently losing a real user fact.
-        jobRetryCount = 0;
-        retryingJob[0] = '\0';
-        retryDelayMs = 60000UL;
-        LOGW("MEM", "Extraction still unavailable after 3 attempts; job retained, retrying in 60s (HTTP=%d)",
-             httpCode);
-      }
-    } else {
-      retryingJob[0] = '\0';
-      jobRetryCount = 0;
-    }
-    bool queueAcknowledged = retryJob;
-    if (!retryJob) {
-      if (xSemaphoreTake(memExtractMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
-        if (memExtractQueueCount > 0 &&
-            strcmp(memExtractQueue[memExtractQueueTail], jobMsg) == 0) {
-          uint8_t completedSlot = memExtractQueueTail;
-          memExtractQueueTail = (memExtractQueueTail + 1) % MEM_EXTRACT_QUEUE_SIZE;
-          memExtractQueueCount--;
-          memExtractQueueEnqueuedAt[completedSlot] = 0;
-          queueAcknowledged = true;
-          LOGI("MEM", "Extraction job removed from queue");
-        } else {
-          LOGE("MEM", "Queue head changed unexpectedly; extraction completion not acknowledged");
-        }
-        xSemaphoreGive(memExtractMutex);
-      } else {
-        LOGE("MEM", "Queue mutex timeout after extraction; job remains queued");
-      }
+    bool pendingBatchItem = false;
+    for (uint8_t i = 0; i < batchCount; i++)
+      if (!completed[i]) pendingBatchItem = true;
+    bool anyAcknowledged = memExtractAckBatch(jobIds, completed, batchCount);
+    if (pendingBatchItem || !anyAcknowledged) {
+      LOGW("MEM", "Batch incomplete; unacknowledged IDs remain queued (HTTP=%d parsed=%d)",
+           httpCode, responseParsed);
     }
     http.end();
     xSemaphoreGive(memoryWorkMutex);
-    if (retryJob) {
-      bool workerDetached = false;
-      if (xSemaphoreTake(memExtractMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
-        memExtractNotBefore = millis() + retryDelayMs;
-        if (memExtractTaskHandle == xTaskGetCurrentTaskHandle()) {
-          // The queued job survives its retry delay, but the idle worker must
-          // release its stack so a later foreground TLS request has the heap.
-          memExtractTaskHandle = NULL;
-          workerDetached = true;
-        }
-        xSemaphoreGive(memExtractMutex);
-      }
-      if (workerDetached) {
-        LOGI("MEM", "Retry job retained; stopping worker to release stack for %lu ms",
-             (unsigned long)retryDelayMs);
-        vTaskDelete(NULL);
-      }
-      LOGW("MEM", "Could not detach retry worker; keeping queued job and retrying shortly");
-      vTaskDelay(pdMS_TO_TICKS(1000));
-      if (memExtractTaskHandle) xTaskNotifyGive(memExtractTaskHandle);
-      continue;
-    }
-    if (!queueAcknowledged) {
-      vTaskDelay(pdMS_TO_TICKS(1000));
-      xTaskNotifyGive(memExtractTaskHandle);
-      continue;
-    }
     bool moreQueued = false;
     bool queueStateRead = false;
     TaskHandle_t workerToNotify = NULL;
     if (xSemaphoreTake(memExtractMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
       queueStateRead = true;
       moreQueued = memExtractQueueCount > 0;
-      if (moreQueued) {
-        workerToNotify = memExtractTaskHandle;
-      } else if (memExtractTaskHandle == xTaskGetCurrentTaskHandle()) {
-        // Releasing an idle worker's stack restores enough heap for deferred
-        // local-memory saves and cloud syncs to pass their 64 KB safety gate.
+      if ((pendingBatchItem || !anyAcknowledged || !moreQueued) &&
+          memExtractTaskHandle == xTaskGetCurrentTaskHandle()) {
+        memExtractNotBefore = millis() + 60000UL;
         memExtractTaskHandle = NULL;
+      } else if (moreQueued) {
+        workerToNotify = memExtractTaskHandle;
       }
       xSemaphoreGive(memExtractMutex);
     }
-    if (moreQueued) {
+    if (queueStateRead && (pendingBatchItem || !anyAcknowledged)) {
+      LOGI("MEM", "Incomplete batch retained; worker stopping to release stack for 60s");
+      vTaskDelete(NULL);
+    } else if (moreQueued) {
       if (workerToNotify) xTaskNotifyGive(workerToNotify);
     } else if (queueStateRead) {
       LOGI("MEM", "Extraction queue empty; stopping worker to release stack");
@@ -765,6 +792,22 @@ void requestMemoryExtract(const char* msg) {
                              strstr(lowerMessage, " i ") || strncmp(lowerMessage, "i ", 2) == 0 ||
                              strstr(lowerMessage, "i'm") || strstr(lowerMessage, "i am ") ||
                              strstr(lowerMessage, "i like ") || strstr(lowerMessage, "i love ");
+  static const char* const durableCues[] = {
+    "my name is", "my favorite", "my favourite", "my hobby", "my hobbies",
+    "i study", "i'm studying", "i am studying", "im studying", "i work", "i'm working", "i am working", "im working",
+    "i live", "i grew up", "i was born", "i like", "i love", "i enjoy", "i prefer",
+    "i usually", "i often", "i tend to", "i always", "i collect", "i play", "i practice",
+    "i'm a ", "i am a ", "im a ", "i have a ", "i have an ", "i own", "i'm into", "i am into", "im into",
+    "i've been", "ive been"
+  };
+  bool likelyDurable = false;
+  for (size_t i = 0; i < sizeof(durableCues) / sizeof(durableCues[0]); i++) {
+    if (strstr(lowerMessage, durableCues[i])) { likelyDurable = true; break; }
+  }
+  if (!likelyDurable) {
+    LOGD("MEM", "Extraction skipped: no stable first-person disclosure cue");
+    return;
+  }
   if (strlen(first) < 64 && startsGreeting && !containsPersonalCue) {
     LOGD("MEM", "Extraction skipped: greeting/small talk");
     return;
@@ -784,43 +827,51 @@ void requestMemoryExtract(const char* msg) {
     LOGW("MEM", "Extract skipped: shared AI network mutex unavailable");
     return;
   }
-  // Include a small amount of dialogue context so the worker can distinguish
-  // real disclosures from details introduced for a fictional scene.
-  static char extractionInput[1152];
-  int inputUsed = snprintf(extractionInput, sizeof(extractionInput),
-                           "CURRENT USER MESSAGE:\n%.220s\nRECENT DIALOGUE:",
-                           msg);
-  int historyIndices[6];
-  int historyCount = 0;
-  for (int offset = 2; offset <= MAX_MESSAGES && historyCount < 6; offset++) {
-    int idx = (messageIndex + MAX_MESSAGES - offset) % MAX_MESSAGES;
-    const char* entry = receivedMessages[idx].content;
-    if ((strncmp(entry, "User: ", 6) != 0 && strncmp(entry, "Yuki: ", 6) != 0) || !entry[6]) continue;
-    historyIndices[historyCount++] = idx;
+  // Keep only this user's source statement. Fiction quarantine is checked both
+  // here and again by the worker before processing a queued candidate.
+  static char extractionInput[MEM_EXTRACT_ITEM_LEN];
+  size_t inputUsed = 0;
+  for (const unsigned char* p = (const unsigned char*)msg;
+       *p && inputUsed + 1 < sizeof(extractionInput); p++) {
+    extractionInput[inputUsed++] = (*p < 0x20) ? ' ' : (char)*p;
   }
-  for (int i = historyCount - 1; i >= 0 && inputUsed > 0 &&
-       (size_t)inputUsed < sizeof(extractionInput) - 8; i--) {
-    const char* entry = receivedMessages[historyIndices[i]].content;
-    const char* role = (strncmp(entry, "User: ", 6) == 0) ? "User" : "Yuki";
-    int wrote = snprintf(extractionInput + inputUsed, sizeof(extractionInput) - inputUsed,
-                         "\n%s: %.100s", role, entry + 6);
-    if (wrote <= 0 || (size_t)wrote >= sizeof(extractionInput) - inputUsed) break;
-    inputUsed += wrote;
-  }
+  extractionInput[inputUsed] = '\0';
+  char normalizedCandidate[MEM_EXTRACT_ITEM_LEN];
+  memExtractNormalizeCandidate(extractionInput, normalizedCandidate, sizeof(normalizedCandidate));
 
   // Enqueue the message and snapshot the worker handle under the same mutex.
   // This prevents notifying a task handle just as an idle worker exits.
   TaskHandle_t workerToNotify = NULL;
   uint8_t queuedCount = 0;
+  uint32_t queuedId = 0;
   if (xSemaphoreTake(memExtractMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+    for (uint8_t i = 0; i < memExtractQueueCount; i++) {
+      uint8_t slot = (memExtractQueueTail + i) % MEM_EXTRACT_QUEUE_SIZE;
+      char queuedNormalized[MEM_EXTRACT_ITEM_LEN];
+      memExtractNormalizeCandidate(memExtractQueue[slot], queuedNormalized, sizeof(queuedNormalized));
+      if (strcmp(queuedNormalized, normalizedCandidate) == 0) {
+        queuedId = memExtractQueueId[slot];
+        queuedCount = memExtractQueueCount;
+        xSemaphoreGive(memExtractMutex);
+        LOGI("MEM", "Duplicate extraction candidate skipped id=%lu queue=%u/%u",
+             (unsigned long)queuedId, queuedCount, MEM_EXTRACT_QUEUE_SIZE);
+        return;
+      }
+    }
+    queuedId = memExtractNextId++;
+    if (memExtractNextId == 0) memExtractNextId = 1;
+    if (queuedId == 0) queuedId = memExtractNextId++;
     if (memExtractQueueCount >= MEM_EXTRACT_QUEUE_SIZE) {
+      queuedCount = memExtractQueueCount;
       xSemaphoreGive(memExtractMutex);
-      LOGE("MEM", "Extraction queue full; rejected new job without discarding queued jobs");
+      LOGE("MEM", "Extraction candidate rejected id=%lu reason=queue_full queue=%u/%u text=%.48s",
+           (unsigned long)queuedId, queuedCount, MEM_EXTRACT_QUEUE_SIZE, extractionInput);
       return;
     }
     strncpy(memExtractQueue[memExtractQueueHead], extractionInput, sizeof(memExtractQueue[0]) - 1);
     memExtractQueue[memExtractQueueHead][sizeof(memExtractQueue[0]) - 1] = '\0';
     memExtractQueueEnqueuedAt[memExtractQueueHead] = millis();
+    memExtractQueueId[memExtractQueueHead] = queuedId;
     memExtractQueueHead = (memExtractQueueHead + 1) % MEM_EXTRACT_QUEUE_SIZE;
     memExtractQueueCount++;
     queuedCount = memExtractQueueCount;
@@ -835,8 +886,8 @@ void requestMemoryExtract(const char* msg) {
     LOGW("MEM", "Queue mutex timeout while enqueueing");
     return;
   }
-  LOGI("MEM","Queued extraction (%u/%u) oldest_age_ms=0: %.40s...",
-       queuedCount, MEM_EXTRACT_QUEUE_SIZE, msg);
+  LOGI("MEM","Queued extraction id=%lu (%u/%u): %.48s",
+       (unsigned long)queuedId, queuedCount, MEM_EXTRACT_QUEUE_SIZE, extractionInput);
   if (workerToNotify) {
     xTaskNotifyGive(workerToNotify);
   } else {
@@ -866,7 +917,7 @@ void consolidateMemory() {
     core_chatSummary);
 
   // Use syncAI with a quiet return — this will update the summary slot via [MEM:] handler
-  syncAI(consolidPrompt, false, FACE, true, false);
+  syncAI(consolidPrompt, false, FACE, true, false, false, NULL);
   LOGI("MEM","Consolidation complete, journal now %u chars", (unsigned)strlen(core_chatSummary));
 }
 
@@ -884,6 +935,9 @@ static void enterLowVoltageMode() {
   pendingMemorySave = false;
   pendingMemoryExtract = false;
   if (memExtractMutex && xSemaphoreTake(memExtractMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    memset(memExtractQueue, 0, sizeof(memExtractQueue));
+    memset(memExtractQueueId, 0, sizeof(memExtractQueueId));
+    memset(memExtractQueueEnqueuedAt, 0, sizeof(memExtractQueueEnqueuedAt));
     memExtractQueueHead = 0;
     memExtractQueueTail = 0;
     memExtractQueueCount = 0;
@@ -957,7 +1011,8 @@ int gameTries = 0;
 // Forward declarations
 void gainXP(int amount);
 void pickBootMessage();
-void syncAI(const char* prompt, bool isPersonal, Mode returnMode, bool bypassCooldown, bool speak);
+void syncAI(const char* prompt, bool isPersonal, Mode returnMode, bool bypassCooldown, bool speak,
+            bool freshWakeContext, const char* historyUserText);
 void handleGameRPGMode();
 void handleConfirmSaveRPGMode();
 void applyMoodDrift();
@@ -1175,6 +1230,12 @@ static void acknowledgePhysicalWake() {
 
 // --- YUKI SLEEP FUNCTION DEFINITIONS ---
 void enterYukiSleep() {
+  if (!yukiSleeping) {
+    sleepConversationBoundaryActive = true;
+    sleepConversationEntriesSinceBoundary = 0;
+    conversationSessionNotes[0] = '\0';
+    LOGI("CHAT", "Sleep boundary checkpoint; prior dialogue retained for explicit references only");
+  }
   // Trigger memory consolidation if journal has enough content and it's been a while
   if (strlen(core_chatSummary) > 200 && millis() - lastConsolidation > 3600000UL) {
     pendingMemoryConsolidation = true;
@@ -1221,9 +1282,9 @@ extern char rpgChoices[3][40];
 extern int rpgChoiceIdx;
 
 // --- MEMORY VAULT ---
-void saveSys() {
-  if (conversationTestMode) { LOGI("TEST", "PERSIST_SUPPRESS reason=test_mode path=sys_save"); return; }
-  if (!canAllocJson(2048)) { heapLogAndWarn("saveSys_skip"); return; }
+bool saveSys() {
+  if (conversationTestMode) { LOGI("TEST", "PERSIST_SUPPRESS reason=test_mode path=sys_save"); return false; }
+  if (!canAllocJson(2048)) { heapLogAndWarn("saveSys_skip"); return false; }
   enforceStringCaps(); // Apply caps before saving
   DynamicJsonDocument doc(2048);
   doc["s"] = sys.ssid; doc["p"] = sys.pass;
@@ -1274,12 +1335,18 @@ void saveSys() {
   // CRC32: serialize with placeholder, compute, re-serialize with real value
   doc["crc"] = (uint32_t)0;
   size_t p = serializeJson(doc, workspace, sizeof(workspace));
+  if (p == 0 || p >= sizeof(workspace)) {
+    LOGE("FS", "System settings JSON exceeds save buffer");
+    return false;
+  }
   uint32_t crc = crc32Calc((const uint8_t*)workspace, p);
   doc["crc"] = crc;
   p = serializeJson(doc, workspace, sizeof(workspace));
-  if (atomicWriteFile("/sys.json", workspace, p)) {
-    copyFile("/sys.json", "/sys.bak"); // Backup for crash recovery
-  }
+  if (p == 0 || p >= sizeof(workspace) || !atomicWriteFile("/sys.json", workspace, p))
+    return false;
+  if (!copyFile("/sys.json", "/sys.bak"))
+    LOGW("FS", "System settings saved, but backup copy failed");
+  return true;
 }
 
 void gainXP(int amount) {
@@ -1678,17 +1745,9 @@ Serial.printf("SSD1306 initialized at 0x%02X\n", oledAddr);
   enforceStringCaps(); // Apply string caps after loading
   autoCleanupLittleFS(); // Clean up LittleFS if space is low
 
-  // Feature 4: Session mode reflects the relationship, not random
-  if (sys.affinity > 60) {
-    // Warm relationship — chatty or reflective
-    sessionMode = (random(0, 2) == 0) ? PM_CHATTY : PM_REFLECTIVE;
-  } else if (sys.affinity < -30) {
-    // Strained — quiet or sassy
-    sessionMode = (random(0, 2) == 0) ? PM_QUIET : PM_SASSY;
-  } else {
-    // Neutral — anything goes
-    sessionMode = (PersonalityMode)random(0, 4);
-  }
+  // Keep session style independent of affinity thresholds. Relationship
+  // closeness is supplied gradually in the chat prompt instead.
+  sessionMode = (PersonalityMode)random(0, 4);
 
   // Integrity guard: prevent corrupt saves from wiping progress
   if (sys.level < 1)  sys.level = 1;
@@ -1912,7 +1971,10 @@ void loop() {
   }
 
   // --- SLEEP CHECK ---
-  if (!conversationTestMode && millis() - lastActivity > sleepTimeout && !yukiSleeping) {
+  if (!conversationTestMode && !pendingResponse && activeForegroundTurnId == 0 &&
+      !pendingIntentFollowUp && !ttsPlaying && !ttsPendingSpeak &&
+      millis() - lastActivity > sleepTimeout && !yukiSleeping) {
+    unsigned long sleepActivitySnapshot = lastActivity;
     display.clearDisplay();
     display.setCursor(10, 30);
     display.println("Entering Sleep...");
@@ -1921,6 +1983,17 @@ void loop() {
     display.display();
     sound_sleep_farewell();
     delay(1000); // Show message before sleeping
+
+    // Drain one final broker packet before disconnecting. If a message arrived
+    // during the sleep transition, keep Yuki awake and let the normal turn path run.
+    if (mqttClient.connected()) mqttClient.loop();
+    if (conversationTestMode || pendingResponse || pendingIntentFollowUp ||
+        activeForegroundTurnId != 0 || lastActivity != sleepActivitySnapshot) {
+      LOGI("CHAT", "Sleep cancelled: foreground input arrived during transition");
+      lastActivity = millis();
+      drawAesthetica();
+      return;
+    }
     
     display.ssd1306_command(SSD1306_DISPLAYOFF);
     
@@ -1990,7 +2063,7 @@ void loop() {
       drawAesthetica();
     } else if (autoWoke) {
       heavyOpCooldown();
-      syncAI("You just woke up from a nap on your own. Say one brief, gentle, groggy line about feeling sleepy. Do not ask a question or invent details about the room, time, or user.", false, FACE, false, true);
+      syncAI("You just woke up from a nap on your own. Say one brief, gentle, groggy line about feeling sleepy. Do not ask a question or invent details about the room, time, or user.", false, FACE, false, true, true);
       heavyOpCooldown();
     }
 
@@ -2038,7 +2111,7 @@ void loop() {
     lastTouchTime = millis();
   }
 
-  // --- YUKI PULSE (LLM-driven behavioral heartbeat) ---
+  // --- YUKI PULSE (LLM-driven, speech-gated idle behavior) ---
   bool inBurst = (pulseBurstCount > 0);
   if (!conversationTestMode && currentMode == FACE && !yukiSleeping && !yukiGroggy && !pendingResponse &&
       ESP.getFreeHeap() >= MEM_EXTRACT_MIN_HEAP &&
@@ -2063,6 +2136,14 @@ void loop() {
 
       if (WiFi.status() != WL_CONNECTED) {
         offlinePulseAction();
+      } else if (!idleModelRequestAllowed()) {
+        const char* gateReason = idleModelRequestGateReason();
+        PulseResult r;
+        memset(&r, 0, sizeof(r));
+        setPulseQuiet(r, gateReason);
+        LOGI("PULSE", "Skipping idle LLM request; gate is closed (%s)", gateReason);
+        executePulseAction(r);
+        pulseBurstCount = 0;
       } else {
         // Silent weather refresh every 30 minutes during pulses
         if (millis() - lastWeatherUpdate > 1800000) {
@@ -2072,13 +2153,17 @@ void loop() {
         buildPulseContext(ctx, sizeof(ctx));
         PulseResult r = callPulseAI(ctx);
         executePulseAction(r);
-        // All actions are now meaningful — every pulse costs energy
-        consecutiveNothingCount = 0;
-        pulseBurstCount++;
-        yukiEnergy -= 0.005f;
-        if (yukiEnergy < 0.1f) yukiEnergy = 0.1f;
-        if (pulseBurstCount >= 3 || random(0, 10) >= 3) {
+        if (strcmp(r.action, "none") == 0) {
           pulseBurstCount = 0;
+        } else {
+          // Successful pulse actions cost energy; failed generations end the burst.
+          consecutiveNothingCount = 0;
+          pulseBurstCount++;
+          yukiEnergy -= 0.005f;
+          if (yukiEnergy < 0.1f) yukiEnergy = 0.1f;
+          if (pulseBurstCount >= 3 || random(0, 10) >= 3) {
+            pulseBurstCount = 0;
+          }
         }
       }
 
@@ -2094,18 +2179,9 @@ void loop() {
     }
   }
 
-  // --- MICRO-EXPRESSION FREQUENCY (Change #9) ---
-  // Fires independently of pulse timer — random face twitches every 60s, only when neutral
-  static unsigned long lastMicroExprCheck = 0;
-  if (currentMode == FACE && !yukiSleeping && !yukiGroggy && !pendingResponse &&
-      currentEmotion == NEUTRAL && millis() - lastMicroExprCheck > 60000 && random(4) == 0) {
-    lastMicroExprCheck = millis();
-    if (microExpressionUntil == 0) { // don't stack on existing micro-expression
-      Emotion microEmotions[] = {HAPPY, SHY, WINK, THINKING_FACE, LOVE, CONFUSED, SASSY};
-      microEmotion = microEmotions[random(7)];
-      microExpressionUntil = millis() + 500;
-    }
-  }
+  // Random idle micro-expressions were removed because they briefly changed
+  // Yuki's face without a matching interaction or reply. Explicit pulse-driven
+  // expressions remain handled by executePulseAction().
 
   // Reset daily greeting flags at noon
   int pulseHour = timeClient.getHours();
@@ -2176,9 +2252,13 @@ void loop() {
       currentEmotion = THINKING_FACE;
       drawAesthetica();
       bool isPersonalReply = (strcmp(lastSenderID, PHONE_CONTACT_ID) == 0);
+      char turnRecipient[sizeof(lastSenderID)];
+      strncpy(turnRecipient, lastSenderID, sizeof(turnRecipient) - 1);
+      turnRecipient[sizeof(turnRecipient) - 1] = '\0';
       conversationTestTurnInProgress = conversationTestMode;
       activeForegroundTurnId = ++foregroundTurnSequence;
       if (activeForegroundTurnId == 0) activeForegroundTurnId = ++foregroundTurnSequence;
+      uint32_t dispatchedTurnId = activeForegroundTurnId;
       LOGI("NET", "AI_TURN_DISPATCH id=%lu wait_ms=%lu prompt_chars=%u",
            (unsigned long)activeForegroundTurnId,
            (unsigned long)(millis() - pendingResponseAt),
@@ -2186,7 +2266,8 @@ void loop() {
       syncAI(responsePrompt, isPersonalReply, FACE, false, true);
       activeForegroundTurnId = 0;
       conversationTestTurnInProgress = false;
-      sendMessage(lastSenderID, aiMsg);
+      LOGI("CHAT", "Reply ready turn=%lu recipient=%s", (unsigned long)dispatchedTurnId, turnRecipient);
+      sendMessage(turnRecipient, aiMsg);
       pendingResponse = false;
       pendingResponseAt = 0;
     }
@@ -2262,9 +2343,27 @@ void loop() {
     int8_t reaction = pendingPresenceReaction;
     pendingPresenceReaction = 0;
     if (reaction > 0) {
-    syncAI("[System Event: The user's phone is now reachable on the home network. If a greeting feels natural, offer one brief, warm line; don't assume the user has just arrived or imply they owe you attention.]", false, FACE, true, true);
+      char presencePrompt[384];
+      if (pendingReturnAbsenceHours >= 72) {
+        snprintf(presencePrompt, sizeof(presencePrompt),
+                 "[System Event: The user's phone is reachable again after being away for %lu hours. Offer a brief, warm welcome-back line with actual acknowledgment of the gap; don't pressure, blame, or pretend to know why they were gone.]",
+                 pendingReturnAbsenceHours);
+      } else if (pendingReturnAbsenceHours >= 24) {
+        snprintf(presencePrompt, sizeof(presencePrompt),
+                 "[System Event: The user's phone is reachable again after about %lu hours away. Offer a brief, warm welcome-back greeting that reflects the time apart without guilt or overdoing it.]",
+                 pendingReturnAbsenceHours);
+      } else if (pendingReturnAbsenceHours >= 12) {
+        snprintf(presencePrompt, sizeof(presencePrompt),
+                 "[System Event: The user is back after being away for %lu hours. Give one short, affectionate acknowledgment of their return and keep it natural.]",
+                 pendingReturnAbsenceHours);
+      } else {
+        snprintf(presencePrompt, sizeof(presencePrompt),
+                 "[System Event: The user's phone is now reachable on the home network. If a greeting feels natural, offer one brief, warm line; don't assume the user has just arrived or imply they owe you attention.]");
+      }
+      syncAI(presencePrompt, false, FACE, true, true);
+      pendingReturnAbsenceHours = 0;
     } else {
-    syncAI("[System Event: The user's phone has been unreachable on the home network for several minutes. Only offer a gentle goodbye if it feels natural; don't claim certainty that the user left, and never guilt them.]", false, FACE, true, true);
+      syncAI("[System Event: The user's phone has been unreachable on the home network for several minutes. Only offer a gentle goodbye if it feels natural; don't claim certainty that the user left, and never guilt them.]", false, FACE, true, true);
     }
   }
 
@@ -2298,6 +2397,13 @@ void loop() {
     lastWeatherUpdate = millis();
   }
 
+  if (pendingWeatherReaction &&
+      (millis() - lastWeatherChangeTime > WEATHER_REACTION_MAX_AGE_MS ||
+       notableWeatherGroup(weatherCode) == 0)) {
+    pendingWeatherReaction = false;
+    LOGI("NET", "Discarding stale or no-longer-notable weather reaction");
+  }
+
   // Run weather-triggered AI work only after updateWeather() has returned.
   // This avoids nesting the large chat/TLS path inside the weather/TLS path.
   if (pendingWeatherReaction &&
@@ -2313,10 +2419,75 @@ void loop() {
       !ttsPendingSpeak &&
       !lowVoltageMode &&
       millis() - lastIdleAction >= 6000 &&
-      millis() - lastInteraction >= 5000) {
+      millis() - lastInteraction >= 5000 &&
+      idleSpeechAllowed()) {
     pendingWeatherReaction = false;
-    LOGI("NET", "Dispatching deferred weather reaction");
-    syncAI("The weather shifted. If it's notable (rain, snow, storm), briefly mention it. Otherwise skip.", false, FACE, false);
+    const char* condition = notableWeatherDescription(weatherCode);
+    char weatherPrompt[384];
+    snprintf(weatherPrompt, sizeof(weatherPrompt),
+             "Current weather update: %s is active at the device's configured location (weather code %d). "
+             "Offer one brief, conversational observation in Yuki's expressive companion voice; a playful "
+             "note is welcome only if it suits the condition. Do not turn it into a report or add a forecast, "
+             "temperature description, location name, or claim about the user's surroundings.",
+             condition, weatherCode);
+    LOGI("NET", "Dispatching current notable weather reaction: %s", condition);
+    syncAI(weatherPrompt, false, FACE, false);
+    recordIdleSpeech();
+  }
+
+  if (idleNewsIsDue() &&
+      !conversationTestMode &&
+      currentMode == FACE &&
+      !yukiSleeping &&
+      !yukiGroggy &&
+      !pendingResponse &&
+      !pendingIntentFollowUp &&
+      !pendingGeocode &&
+      pendingPresenceReaction == 0 &&
+      !pendingWeatherReaction &&
+      !lowVoltageMode &&
+      yukiEnergy >= 0.35f &&
+      ESP.getFreeHeap() >= MEM_EXTRACT_MIN_HEAP &&
+      WiFi.status() == WL_CONNECTED &&
+      !ttsPlaying &&
+      !ttsPendingSpeak &&
+      millis() - lastIdleAction >= 6000 &&
+      idleSpeechAllowed() &&
+      memoryWorkMutex &&
+      !memExtractTaskHandle) {
+    if (xSemaphoreTake(memoryWorkMutex, 0) == pdTRUE) {
+      char headlines[320] = {};
+      const bool headlinesFetched = fetchHeadlines(headlines, sizeof(headlines));
+      xSemaphoreGive(memoryWorkMutex);
+
+      if (!headlinesFetched) {
+        deferIdleNewsRetry();
+      } else if (isRepeatedIdleNews(headlines)) {
+        LOGI("NEWS", "Skipping recently repeated idle headlines");
+        scheduleNextIdleNewsInterval();
+      } else {
+        char newsPrompt[1024];
+        if (lastIdleNewsHeadlines[0]) {
+          snprintf(newsPrompt, sizeof(newsPrompt),
+                   "Here are today's headlines: %.300s. Pick ONE you find interesting and react naturally "
+                   "in one brief sentence that sounds like Yuki: emotionally attentive for serious news, "
+                   "lightly playful only when appropriate. Do not claim personal experience or say you read the news. "
+                   "Avoid these headlines mentioned during the previous idle news visit: %.280s",
+                   headlines, lastIdleNewsHeadlines);
+        } else {
+          snprintf(newsPrompt, sizeof(newsPrompt),
+                   "Here are today's headlines: %.500s. Pick ONE you find interesting and react naturally "
+                   "in one brief sentence that sounds like Yuki: emotionally attentive for serious news, "
+                   "lightly playful only when appropriate. Do not claim personal experience or say you read the news.",
+                   headlines);
+        }
+        rememberIdleNews(headlines);
+        scheduleNextIdleNewsInterval();
+        LOGI("NEWS", "Sharing one headline after a long quiet period");
+        syncAI(newsPrompt, false, FACE, false, true);
+        recordIdleSpeech();
+      }
+    }
   }
 
   // Periodic heap warning; low free heap alone is not grounds for a reset.
@@ -2463,10 +2634,15 @@ void loop() {
       }
       activeForegroundTurnId = ++foregroundTurnSequence;
       if (activeForegroundTurnId == 0) activeForegroundTurnId = ++foregroundTurnSequence;
+      uint32_t wakeTurnId = activeForegroundTurnId;
       LOGI("NET", "AI_TURN_DISPATCH id=%lu source=sleep_wake prompt_chars=%u",
            (unsigned long)activeForegroundTurnId, (unsigned)strlen(wakePrompt));
-      syncAI(wakePrompt, true, FACE, true, true);
+      bool allowPriorContext = conversationPromptReferencesPriorScene(pendingWakeMsg);
+      LOGI("CHAT", "Sleep-wake context=%s turn_id=%lu", allowPriorContext ? "referenced" : "fresh",
+           (unsigned long)activeForegroundTurnId);
+      syncAI(wakePrompt, true, FACE, true, true, !allowPriorContext, pendingWakeMsg);
       activeForegroundTurnId = 0;
+      LOGI("CHAT", "Wake reply ready turn=%lu recipient=%s", (unsigned long)wakeTurnId, lastSenderID);
       sendMessage(lastSenderID, aiMsg);
       drawAesthetica();
       pendingWakeMsg[0] = '\0';
@@ -2475,7 +2651,7 @@ void loop() {
       activeForegroundTurnId = ++foregroundTurnSequence;
       if (activeForegroundTurnId == 0) activeForegroundTurnId = ++foregroundTurnSequence;
       LOGI("NET", "AI_TURN_DISPATCH id=%lu source=self_wake", (unsigned long)activeForegroundTurnId);
-      syncAI("You just woke up from deep sleep on your own. Say one brief, gentle, groggy line about feeling sleepy. Do not ask a question or invent details about the room, time, or user.", false, FACE, true, true);
+      syncAI("You just woke up from deep sleep on your own. Say one brief, gentle, groggy line about feeling sleepy. Do not ask a question or invent details about the room, time, or user.", false, FACE, true, true, true);
       activeForegroundTurnId = 0;
       drawAesthetica();
     }

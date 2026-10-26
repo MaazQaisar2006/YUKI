@@ -428,7 +428,7 @@ void handleFaceMode() {
       touchEvent = "The user gently patted Yuki.";
       sound_purr();
       bool wasSadOrSleepy = currentEmotion == SAD || currentEmotion == SLEEPY;
-      currentEmotion = (sys.affinity > 30) ? LOVE : BLUSHING;
+      currentEmotion = wasSadOrSleepy ? LOVE : BLUSHING;
       if (touchAnnoyance > 8) {
         strncpy(touchPrompt, "A little break from pats, please.", sizeof(touchPrompt)-1);
         currentEmotion = SASSY; shouldSpeak = true;
@@ -439,7 +439,7 @@ void handleFaceMode() {
         strncpy(touchPrompt, "That was nice. Thank you.", sizeof(touchPrompt)-1);
         core_badDayFlag = false; // Pat helps recovery
         shouldSpeak = true;
-      } else if (sys.affinity > 50) {
+      } else if (currentEmotion == LOVE) {
         strncpy(touchPrompt, "Heh, that was sweet of you.", sizeof(touchPrompt)-1);
         if (random(0, 10) < 7) shouldSpeak = true;
       } else {
@@ -449,23 +449,26 @@ void handleFaceMode() {
     } else { // LONG HUG / EMBRACE
       touchEvent = "The user held the touch button for a while.";
       sound_purr();
-      if (sys.affinity < 0) {
-        strncpy(touchPrompt, "I'm not quite comfortable with a hug right now.", sizeof(touchPrompt)-1);
-        currentEmotion = FLUSTERED; shouldSpeak = true;
-      } else if (core_badDayFlag) {
-        strncpy(touchPrompt, "Thanks. That was comforting.", sizeof(touchPrompt)-1);
-        core_badDayFlag = false; // Embrace heals a bad day
-        touchAnnoyance = 0; shouldSpeak = true;
-        if (!conversationTestMode) {
-          sys.affinity = constrain(sys.affinity + 3, -100, 100);
-          saveSys();
-        }
+      if (touchAnnoyance > 8) {
+        strncpy(touchPrompt, "I need a little space from touches right now.", sizeof(touchPrompt)-1);
+        currentEmotion = SASSY; shouldSpeak = true;
       } else {
-        strncpy(touchPrompt, "Aw, thanks for the hug.", sizeof(touchPrompt)-1);
+        if (core_badDayFlag) {
+          strncpy(touchPrompt, "Thanks. That was comforting.", sizeof(touchPrompt)-1);
+          core_badDayFlag = false; // An accepted embrace can comfort a bad day
+        } else {
+          strncpy(touchPrompt, "Aw, thanks for the hug.", sizeof(touchPrompt)-1);
+        }
+        currentEmotion = LOVE;
         touchAnnoyance = 0; shouldSpeak = true;
         if (!conversationTestMode) {
-          sys.affinity = constrain(sys.affinity + 2, -100, 100);
-          saveSys();
+          int oldAffinity = sys.affinity;
+          sys.affinity = constrain(sys.affinity + 1, -100, 100);
+          if (sys.affinity != oldAffinity) {
+            saveSys();
+            LOGI("AFF", "source=touch_hug old=%d delta=%d new=%d",
+                 oldAffinity, sys.affinity - oldAffinity, sys.affinity);
+          }
         }
       }
     }
@@ -1344,26 +1347,53 @@ void handleShutdownConfirmMode() {
   if(digitalRead(BTN_SEL) == LOW && millis() - lastButtonPress > debounceDelay) {
     lastButtonPress = millis(); lastActivity = millis(); lastInteraction = millis(); lastIdleCheck = millis();
     if (shutdownChoice == 0) {
-      // YES - do shutdown
-      // 1. INSTANT display feedback FIRST
-      display.clearDisplay(); display.setCursor(0, 20); display.println("Shutting down..."); display.display(); display.flush(); delay(200);
-      
-      // Quick saves (no blocking)
-      if (pendingSysSave) saveSys();
-      if (pendingCloudSync) saveCoreMemory();
-      
-      // Quick cleanup
+      bool memoryWorkerActive = false;
+      if (!memExtractMutex ||
+          xSemaphoreTake(memExtractMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        LOGW("SHUTDOWN", "Cannot verify background memory worker; shutdown cancelled");
+        display.clearDisplay(); display.setCursor(0, 16); display.println("Memory busy");
+        display.setCursor(0, 32); display.println("Power still on");
+        display.setCursor(0, 48); display.println("Retry shutdown");
+        display.display(); display.flush();
+        return;
+      }
+      memoryWorkerActive = memExtractTaskHandle != NULL;
+      xSemaphoreGive(memExtractMutex);
+      if (pendingResponse || activeForegroundTurnId != 0 || memoryWorkerActive) {
+        LOGW("SHUTDOWN", "Foreground or background memory work is active; shutdown cancelled");
+        display.clearDisplay(); display.setCursor(0, 16); display.println("Work still active");
+        display.setCursor(0, 32); display.println("Power still on");
+        display.setCursor(0, 48); display.println("Wait, then retry");
+        display.display(); display.flush();
+        return;
+      }
+
+      display.clearDisplay(); display.setCursor(0, 20); display.println("Saving data..."); display.display(); display.flush();
+
+      const bool systemSaved = saveSys();
+      const bool coreMemorySaved = saveCoreMemory();
+      const bool structuredMemorySaved = memoryV2Save();
+      if (!systemSaved || !coreMemorySaved || !structuredMemorySaved) {
+        LOGE("SHUTDOWN", "Local save failed (sys=%d core=%d structured=%d); shutdown cancelled",
+             systemSaved, coreMemorySaved, structuredMemorySaved);
+        display.clearDisplay(); display.setCursor(0, 16); display.println("Save failed!");
+        display.setCursor(0, 32); display.println("Power still on");
+        display.setCursor(0, 48); display.println("Retry shutdown");
+        display.display(); display.flush();
+        return;
+      }
+      pendingSysSave = false;
+      pendingMemorySave = false;
+
+      display.clearDisplay(); display.setCursor(0, 20); display.println("Shutting down..."); display.display(); display.flush();
+      delay(200);
       if (mqttClient.connected()) mqttClient.disconnect();
-      LittleFS.end(); 
-      WiFi.disconnect(true); 
+      WiFi.disconnect(true);
       WiFi.mode(WIFI_OFF);
-      
-      // Show final message
+      LittleFS.end();
+
       display.clearDisplay(); display.setCursor(0, 20); display.println("Safe to power off"); display.display(); display.flush();
-      
-      // Set shutdown flag in RTC memory (fast, non-blocking)
       shutdownFlag = 1;
-      
       esp_restart();
     } else {
       // NO - back to menu

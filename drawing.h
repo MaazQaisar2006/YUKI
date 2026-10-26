@@ -12,6 +12,8 @@ static const char* emotionNames[] = {
 // Per-emotion variant selector (index set by UI/menu; 0-based)
 extern uint8_t emotionVariantIndex[32]; // Shared across all files
 extern unsigned long lastActivity;
+extern volatile bool ttsPlaying;
+extern volatile bool ttsPendingSpeak;
 extern float currentTemp;
 extern int weatherCode;
 inline uint8_t pickVariant(Emotion e, uint8_t count) {
@@ -61,26 +63,9 @@ void drawAesthetica() {
   }
   display.clearDisplay();
   
-  // --- MOOD STAIRCASE (Decay Logic) ---
-  unsigned long currentEmotionEffectiveDuration = emotionDuration; // Base duration from config.h
-
-  // Granular Emotion Duration (Visible in Serial)
-  float multiplier = 1.0;
-  if (sys.affinity > 0) {
-    multiplier = 1.05; // 5% boost for any positive affinity
-    if (sys.affinity > 60) multiplier = 1.25;
-    // When she likes you, your anger/sadness doesn't stick — negative emotions fade faster
-    if (currentEmotion == SAD || currentEmotion == ANGRY) multiplier *= 0.7;
-  } else if (sys.affinity < 0) {
-    // When she's distant, her negative moods linger — they match the moment
-    if (currentEmotion == SAD || currentEmotion == ANGRY || currentEmotion == SASSY) {
-      multiplier = 1.8;
-    } else {
-      multiplier = 0.9; // Other emotions slightly shorter when affinity is low
-      if (sys.affinity < -60) multiplier = 0.6;
-    }
-  }
-  currentEmotionEffectiveDuration = (unsigned long)(emotionDuration * multiplier);
+  // Let the current conversational emotion run on its configured duration.
+  // Relationship affinity must not shorten, prolong, or redirect a feeling.
+  const unsigned long currentEmotionEffectiveDuration = emotionDuration;
 
   static Emotion heldEmotion = NEUTRAL;
   static unsigned long heldEmotionStart = 0;
@@ -94,43 +79,51 @@ void drawAesthetica() {
   unsigned long durationCap = currentEmotionEffectiveDuration * 3;
   bool forceNeutralDecay = (currentEmotion != NEUTRAL && currentEmotion != SLEEPY && millis() - heldEmotionStart > durationCap);
 
-  // Don't decay emotion during Yuki sleep — face stays SLEEPY. Also don't decay SLEEPY — it persists naturally.
-  bool shouldDecay = !yukiSleeping && currentEmotion != SLEEPY &&
+  // Neutral is a stable resting face; affinity does not invent a new mood.
+  // SLEEPY persists until the existing wake/sleep behavior changes it.
+  bool shouldDecay = !yukiSleeping && !ttsPlaying && !ttsPendingSpeak &&
+    currentEmotion != NEUTRAL && currentEmotion != SLEEPY &&
     (millis() - emotionSetTime > currentEmotionEffectiveDuration || forceNeutralDecay);
   if (shouldDecay) {
-    LOGD("DRAW","Emotion Decay: %d | Affinity: %d | Duration Used: %lu", (int)currentEmotion, sys.affinity, currentEmotionEffectiveDuration);
-
+    const Emotion previousMood = currentEmotion;
+    const unsigned long moodHeldMs = millis() - emotionSetTime;
     Emotion nextMood = NEUTRAL; // Default decay target for most emotions
 
-    if (forceNeutralDecay) {
-      nextMood = NEUTRAL;
-    } else if (currentEmotion == NEUTRAL) { // If currently NEUTRAL, check for proactive mood shift based on affinity
-      // (2) Decay Destination: NEUTRAL decay
-      if (sys.affinity > 60) {
-        nextMood = HAPPY;                          // Only drift to happy at genuinely high affinity
-      } else if (sys.affinity > 30 && random(0, 100) < 40) {
-        nextMood = (random(0, 2) == 0) ? HAPPY : WINK; // Warm but not automatic
-      } else if (sys.affinity < -40 && random(0, 100) < 40) {
-        nextMood = (random(0, 3) == 0) ? ANGRY : (random(0, 2) == 0 ? SAD : SASSY);
-      } else {
-        nextMood = NEUTRAL;                        // Default: hold neutral, don't assume happiness
-      }
-    } else { // Decay from a non-NEUTRAL emotion
-    if (currentEmotion == LAUGHING) nextMood = HAPPY;
-    else if (currentEmotion == HAPPY) nextMood = NEUTRAL;
-    else if (currentEmotion == SHOCKED || currentEmotion == SURPRISED) nextMood = CONFUSED;
-    else if (currentEmotion == BLUSHING || currentEmotion == FLUSTERED) nextMood = SHY;
-    else if (currentEmotion == CONFUSED || currentEmotion == THINKING_FACE) nextMood = NEUTRAL;
-    else if (currentEmotion == ANGRY) {
-      if (sys.affinity > 60) nextMood = CONFUSED; // If affinity is very high, ANGRY decays to CONFUSED
-      else nextMood = SAD; // Otherwise, decays to SAD (original logic)
+    if (!forceNeutralDecay) {
+      if (currentEmotion == LAUGHING) nextMood = HAPPY;
+      else if (currentEmotion == SHOCKED || currentEmotion == SURPRISED) nextMood = CONFUSED;
+      else if (currentEmotion == BLUSHING || currentEmotion == FLUSTERED) nextMood = SHY;
+      else if (currentEmotion == ANGRY) nextMood = SAD;
     }
-    else nextMood = NEUTRAL; // For any other non-explicitly handled emotion, it decays to NEUTRAL
-    }
+
+    const int previousIndex = (int)previousMood;
+    const int nextIndex = (int)nextMood;
+    const char* previousName = (previousIndex >= 0 && previousIndex <= (int)BLUSHING)
+      ? emotionNames[previousIndex] : "UNKNOWN";
+    const char* nextName = (nextIndex >= 0 && nextIndex <= (int)BLUSHING)
+      ? emotionNames[nextIndex] : "UNKNOWN";
+    LOGI("FACE", "decay from=%s to=%s reason=%s held_ms=%lu duration_ms=%lu affinity=%d",
+         previousName, nextName, forceNeutralDecay ? "hold_cap" : "timer",
+         moodHeldMs, currentEmotionEffectiveDuration, sys.affinity);
 
     currentEmotion = nextMood;
     emotionSetTime = millis(); // Reset timer for the next step in the staircase
     { uint8_t vc = 1; switch(nextMood) { case NEUTRAL: vc=10; break; case HAPPY: vc=10; break; case SURPRISED: vc=2; break; case SAD: vc=10; break; case ANGRY: vc=4; break; case THINKING_FACE: vc=2; break; case SLEEPY: vc=2; break; case FLUSTERED: vc=3; break; case LAUGHING: vc=3; break; case WINK: vc=3; break; case CONFUSED: vc=2; break; case LOVE: vc=6; break; case SASSY: vc=2; break; case SHOCKED: vc=4; break; case SHY: vc=2; break; case TEASING: vc=5; break; case BLUSHING: vc=5; break; default: vc=1; } emotionVariantIndex[(int)currentEmotion] = (emotionVariantIndex[(int)currentEmotion] + 1) % vc; }
+  }
+
+  static bool neutralIdleVariantActive = false;
+  static unsigned long nextNeutralIdleVariantAt = 0;
+  const bool neutralIdleVariantEligible = currentMode == FACE && currentEmotion == NEUTRAL &&
+    !yukiSleeping && !ttsPlaying && !ttsPendingSpeak && !pendingResponse && !screenOff &&
+    millis() - lastInteraction >= 60000UL;
+  if (!neutralIdleVariantEligible) {
+    neutralIdleVariantActive = false;
+  } else if (!neutralIdleVariantActive) {
+    neutralIdleVariantActive = true;
+    nextNeutralIdleVariantAt = millis() + (unsigned long)random(120000L, 240001L);
+  } else if ((int32_t)(millis() - nextNeutralIdleVariantAt) >= 0) {
+    emotionVariantIndex[(int)NEUTRAL] = (emotionVariantIndex[(int)NEUTRAL] + 1) % 10;
+    nextNeutralIdleVariantAt = millis() + (unsigned long)random(120000L, 240001L);
   }
 
   // 1. Status Bar — rotates through info pages while visible

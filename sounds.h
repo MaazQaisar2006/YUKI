@@ -96,10 +96,8 @@ inline void play_scented_tone(int baseDelay, int duration) {
   if (millis() < soundEnabledAt) return;
   int m = baseDelay;
   if (sys.soundScents) {
-    if (sys.affinity > 75)       m -= 60;
-    else if (sys.affinity > 25)  m -= 30;
-    else if (sys.affinity < -75) m += 100;
-    else if (sys.affinity < -25) m += 50;
+    // Keep the relationship tint gradual instead of switching at score bands.
+    m -= (sys.affinity * 60) / 100;
   }
   playSound(max(10, m), duration);
 }
@@ -420,19 +418,11 @@ inline void sound_success() {
 // AI_REPLY — Personality-tailored, ~450ms total
 inline void sound_ai_reply() {
   if (!sys.soundOn) return;
-  if (sys.affinity > 60) {
-    playSweep(360, 150, 600, 7);
-    delay(10);
-    playSoundV(150, 120, 5);
-  } else if (sys.affinity < -50) {
-    playSweep(400, 700, 500, 6);
-    delay(10);
-    playSoundV(650, 120, 4);
-  } else {
-    playSweep(400, 240, 450, 6);
-    delay(8);
-    playSoundV(260, 120, 5);
-  }
+  // Emotional response sounds are selected from currentEmotion elsewhere;
+  // this neutral acknowledgement must not jump at an affinity threshold.
+  playSweep(400, 240, 450, 6);
+  delay(8);
+  playSoundV(260, 120, 5);
 }
 
 // ======================== AMBIENT (subtle, shorter) ========================
@@ -502,6 +492,4 @@ inline void sound_ambient_state() {
       sound_ambient_playful(); break;
     default:       sound_ambient_idle(); break;
   }
-  if (sys.affinity > 50) { delay(12); playSoundV(300, 60, 4); }
-  else if (sys.affinity < -50) { delay(12); playSoundV(480, 60, 4); }
 }

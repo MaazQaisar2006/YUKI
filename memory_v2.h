@@ -247,6 +247,16 @@ static inline int memoryV2Find(const char* text, uint8_t kind) {
   return -1;
 }
 
+static inline bool memoryV2HasFact(const char* rawText) {
+  if (!rawText || !rawText[0]) return false;
+  char text[MEMORY_V2_FACT_LEN];
+  memoryV2Normalize(rawText, text, sizeof(text));
+  memoryV2CanonicalizeFact(text, sizeof(text));
+  MemoryV2Guard guard;
+  if (!guard.locked) return false;
+  return memoryV2Find(text, MEMORY_V2_FACT) >= 0;
+}
+
 static inline uint16_t memoryV2Priority(uint8_t importance, uint16_t seenCount) {
   uint16_t score = (uint16_t)importance * 100;
   uint16_t repeatBonus = seenCount > 20 ? 20 : seenCount;
@@ -282,6 +292,35 @@ static inline int memoryV2SelectSlot(uint8_t incomingImportance, uint16_t incomi
                         memoryV2Priority(memoryV2Facts[selected].importance,
                                           memoryV2Facts[selected].seenCount)) return selected;
   return selected;
+}
+
+static inline bool memoryV2FactWouldBeRejected(const char* rawText) {
+  if (!rawText || !rawText[0]) return false;
+  char text[MEMORY_V2_FACT_LEN];
+  memoryV2Normalize(rawText, text, sizeof(text));
+  memoryV2CanonicalizeFact(text, sizeof(text));
+  MemoryV2Guard guard;
+  if (!guard.locked || memoryV2Find(text, MEMORY_V2_FACT) >= 0) return false;
+  int category = memoryV2Category(text);
+  uint8_t importance = memoryV2InitialImportance(text, category);
+  if (category >= 0) {
+    for (uint8_t i = 0; i < memoryV2FactCount; i++) {
+      if (memoryV2Facts[i].active && memoryV2Facts[i].kind == MEMORY_V2_FACT &&
+          memoryV2Category(memoryV2Facts[i].text) == category &&
+          importance < memoryV2Facts[i].importance) return true;
+    }
+  }
+  for (uint8_t i = 0; i < memoryV2FactCount; i++)
+    if (!memoryV2Facts[i].active) return false;
+  if (memoryV2FactCount < MEMORY_V2_MAX_FACTS) return false;
+  int selected = -1;
+  for (uint8_t i = 0; i < memoryV2FactCount; i++) {
+    if (selected < 0 ||
+        memoryV2Priority(memoryV2Facts[i].importance, memoryV2Facts[i].seenCount) <
+        memoryV2Priority(memoryV2Facts[selected].importance, memoryV2Facts[selected].seenCount)) selected = i;
+  }
+  return selected >= 0 && memoryV2Priority(importance, 1) <=
+         memoryV2Priority(memoryV2Facts[selected].importance, memoryV2Facts[selected].seenCount);
 }
 
 static inline void memoryV2Observe(const char* rawText, uint8_t kind) {
